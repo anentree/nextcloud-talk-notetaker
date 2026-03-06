@@ -9,6 +9,7 @@ User=notetaker
 Group=notetaker
 WorkingDirectory=/opt/notetaker
 EnvironmentFile=/opt/notetaker/.env
+Environment=XDG_RUNTIME_DIR=/run/user/978
 ExecStart=/opt/notetaker/.venv/bin/notetaker
 Restart=on-failure
 RestartSec=10
@@ -16,8 +17,8 @@ RestartSec=10
 # Hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/tmp/notetaker-audio
+ProtectHome=read-only
+ReadWritePaths=/tmp/notetaker-audio /opt/notetaker/.cache
 PrivateTmp=no
 
 [Install]
