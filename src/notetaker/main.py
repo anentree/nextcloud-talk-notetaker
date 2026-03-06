@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import signal
 import time
 from datetime import date
@@ -12,17 +11,11 @@ from notetaker.config import Config
 from notetaker.mailer import extract_follow_up_email, send_notes_email
 from notetaker.monitor import CallMonitor
 from notetaker.participants import get_participant_emails
-from notetaker.recorder import AudioRecorder
+from notetaker.recorder import AudioRecorder, _slugify
 from notetaker.storage import upload_notes
 from notetaker.transcriber import transcribe_and_summarize
 
 log = logging.getLogger(__name__)
-
-
-def _slugify(name: str) -> str:
-    slug = name.lower().strip()
-    slug = re.sub(r"[^a-z0-9]+", "-", slug)
-    return slug.strip("-")
 
 
 async def handle_call(cfg: Config, room: dict) -> None:

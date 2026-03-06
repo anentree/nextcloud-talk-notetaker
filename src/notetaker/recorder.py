@@ -83,7 +83,10 @@ class AudioRecorder:
         log.info("Created PulseAudio sink %s (module %s)", sink_name, module_id)
 
         # Start recording from the sink's monitor to a raw PCM file
-        raw_path = tempfile.mktemp(suffix=".raw", prefix=f"notetaker_{room_token}_")
+        raw_fd, raw_path = tempfile.mkstemp(
+            suffix=".raw", prefix=f"notetaker_{room_token}_"
+        )
+        os.close(raw_fd)
         with open(raw_path, "wb") as raw_file:
             parec = subprocess.Popen(
                 [
