@@ -1,0 +1,24 @@
+[Unit]
+Description=Nextcloud Talk AI Notetaker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=notetaker
+Group=notetaker
+WorkingDirectory=/opt/notetaker
+EnvironmentFile=/opt/notetaker/.env
+ExecStart=/opt/notetaker/.venv/bin/notetaker
+Restart=on-failure
+RestartSec=10
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/tmp/notetaker-audio
+PrivateTmp=no
+
+[Install]
+WantedBy=multi-user.target
