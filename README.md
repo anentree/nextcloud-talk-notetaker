@@ -1,6 +1,6 @@
 # Nextcloud Talk AI Notetaker
 
-Automatically record, transcribe, and summarize Nextcloud Talk calls using Google Gemini AI. Notes are saved to Nextcloud or locally, and optionally emailed to participants.
+This bot will automatically summarize any Nextcloud Talk calls it's a participant of, using Google Gemini AI. Notes are saved to Nextcloud or locally, and optionally emailed to participants.
 
 ## How It Works
 
