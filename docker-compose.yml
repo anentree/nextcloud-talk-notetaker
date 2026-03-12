@@ -4,6 +4,8 @@ services:
     env_file: .env
     restart: unless-stopped
     shm_size: "1g"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     deploy:
       resources:
         limits:

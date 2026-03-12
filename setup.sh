@@ -154,13 +154,14 @@ NC_URL="${NC_URL%/}"
 NC_USER=$(prompt_value "Enter the bot's username")
 NC_PASS=$(prompt_secret "Enter the bot's password")
 
-# Test API connectivity
-info "Testing connection to $NC_URL..."
+# Test API connectivity (use original URL from the host)
+TEST_URL="$NC_URL"
+info "Testing connection to $TEST_URL..."
 HTTP_CODE=$(curl -s -o /tmp/nc-setup-test.json -w "%{http_code}" \
     -u "$NC_USER:$NC_PASS" \
     -H "OCS-APIRequest: true" \
     -H "Accept: application/json" \
-    "$NC_URL/ocs/v2.php/apps/spreed/api/v4/room" 2>/dev/null || echo "000")
+    "$TEST_URL/ocs/v2.php/apps/spreed/api/v4/room" 2>/dev/null || echo "000")
 
 case "$HTTP_CODE" in
     200)
@@ -168,7 +169,7 @@ case "$HTTP_CODE" in
         # Try to get Nextcloud version
         NC_VER=$(curl -s -u "$NC_USER:$NC_PASS" \
             -H "OCS-APIRequest: true" -H "Accept: application/json" \
-            "$NC_URL/ocs/v1.php/cloud/capabilities" 2>/dev/null \
+            "$TEST_URL/ocs/v1.php/cloud/capabilities" 2>/dev/null \
             | grep -o '"major":[0-9]*' | head -1 | cut -d: -f2 || echo "")
         if [ -n "$NC_VER" ]; then
             info "Nextcloud version: $NC_VER"
@@ -195,6 +196,18 @@ case "$HTTP_CODE" in
         ;;
 esac
 rm -f /tmp/nc-setup-test.json
+
+# Rewrite localhost URLs for Docker container networking
+# localhost inside a container refers to the container itself, not the host
+case "$NC_URL" in
+    http://localhost:*|http://localhost|https://localhost:*|https://localhost)
+        DOCKER_URL=$(echo "$NC_URL" | sed 's|://localhost|://host.docker.internal|')
+        warn "The notetaker runs inside a Docker container where 'localhost'"
+        warn "refers to the container, not your machine."
+        info "Automatically rewriting to: $DOCKER_URL"
+        NC_URL="$DOCKER_URL"
+        ;;
+esac
 
 echo
 AUTH_METHOD="nextcloud"
@@ -281,7 +294,7 @@ else
     DAV_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
         -u "$NC_USER:$NC_PASS" \
         -X PROPFIND \
-        "$NC_URL/remote.php/dav/files/$NC_USER$NOTES_FOLDER" 2>/dev/null || echo "000")
+        "$TEST_URL/remote.php/dav/files/$NC_USER$NOTES_FOLDER" 2>/dev/null || echo "000")
 
     case "$DAV_CODE" in
         207)
