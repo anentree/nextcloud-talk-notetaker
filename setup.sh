@@ -234,16 +234,17 @@ if [ "$STORAGE_CHOICE" = "B" ]; then
 else
     echo
     echo "The bot saves notes to a folder in its own Nextcloud file space."
-    echo "To let other users see the notes, share a folder with the bot:"
+    echo "This can be any folder name you choose (e.g., 'notes', 'calls', etc.)."
     echo
-    echo "  1. Any user creates a folder (e.g., 'meeting-notes') anywhere"
-    echo "  2. Right-click > Share > add the bot user (${NC_USER})"
-    echo "  3. The shared folder appears at the bot's root as its folder name"
+    echo "To let other users see the notes:"
+    echo "  1. Create a folder with any name in any user's Nextcloud"
+    echo "  2. Share that folder with the bot user (${NC_USER})"
+    echo "  3. Enter that folder's name below exactly as it appears to the bot"
     echo
-    echo "If no folder is shared, the bot creates one in its own space"
+    echo "If you skip sharing, the bot creates the folder in its own space"
     echo "(only the bot will be able to see it)."
     echo
-    NOTES_FOLDER=$(prompt_value "Folder name (as it appears in the bot's files)" "meeting-notes")
+    NOTES_FOLDER=$(prompt_value "Folder name" "meeting-notes")
     # Ensure leading slash
     case "$NOTES_FOLDER" in
         /*) ;;
