@@ -79,10 +79,35 @@ else
 fi
 info "Detected OS: $OS_PRETTY"
 
-# Check Docker
+# Check Docker (or Podman compatibility)
 if command -v docker >/dev/null 2>&1; then
-    DOCKER_VERSION=$(docker --version 2>/dev/null || echo "unknown")
-    success "Docker is installed: $DOCKER_VERSION"
+    # Docker CLI found, but can it reach a daemon?
+    if ! docker info >/dev/null 2>&1; then
+        # No daemon — check for Podman socket
+        PODMAN_SOCK="/run/user/$(id -u)/podman/podman.sock"
+        if [ -S "$PODMAN_SOCK" ]; then
+            export DOCKER_HOST="unix://$PODMAN_SOCK"
+            if docker info >/dev/null 2>&1; then
+                success "Docker CLI connected via Podman socket"
+            else
+                error "Docker CLI found but cannot connect to Podman."
+                info "Try: export DOCKER_HOST=unix://$PODMAN_SOCK"
+                exit 1
+            fi
+        elif command -v podman >/dev/null 2>&1; then
+            error "Docker CLI found but no daemon running. Podman is installed but socket not found."
+            info "Start Podman socket: systemctl --user enable --now podman.socket"
+            info "Then: export DOCKER_HOST=unix://$PODMAN_SOCK"
+            exit 1
+        else
+            error "Docker CLI found but the Docker daemon is not running."
+            info "Start it with: sudo systemctl start docker"
+            exit 1
+        fi
+    else
+        DOCKER_VERSION=$(docker --version 2>/dev/null || echo "unknown")
+        success "Docker is installed: $DOCKER_VERSION"
+    fi
 else
     error "Docker is not installed."
     echo
