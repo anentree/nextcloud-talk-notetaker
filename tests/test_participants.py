@@ -84,4 +84,7 @@ def test_skips_users_without_email():
 
     result = get_participant_emails(NEXTCLOUD_URL, "bot", "secret", token)
 
-    assert result == []
+    # User with no email gets a domain-derived fallback
+    assert len(result) == 1
+    assert result[0]["user_id"] == "noemail"
+    assert result[0]["email"] == "noemail@nc.example.com"

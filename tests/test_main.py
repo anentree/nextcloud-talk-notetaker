@@ -1,7 +1,8 @@
 import asyncio
 from unittest.mock import patch, MagicMock, AsyncMock
-from notetaker.main import handle_call
+from notetaker.main import handle_call, _build_notes_filename
 from notetaker.config import Config
+from datetime import datetime
 
 
 @patch("notetaker.main.send_notes_email")
@@ -25,6 +26,7 @@ def test_handle_call_pipeline(
         nextcloud_url="https://nc.example.com",
         nextcloud_user="bot",
         nextcloud_password="secret",
+        nextcloud_web_password="secret",
         gemini_api_key="gemini-key",
     )
     room = {"token": "abc123", "displayName": "Standup"}
@@ -35,3 +37,33 @@ def test_handle_call_pipeline(
     mock_transcribe.assert_called_once()
     mock_upload.assert_called_once()
     mock_email.assert_called_once()
+
+
+def test_build_notes_filename_alphabetical():
+    participants = [
+        {"user_id": "charlie", "display_name": "Charlie Brown"},
+        {"user_id": "alice", "display_name": "Alice Smith"},
+    ]
+    now = datetime(2026, 3, 11, 9, 15)
+    result = _build_notes_filename(participants, now)
+    assert result == "2026-03-11-0915-alice-charlie.md"
+
+
+def test_build_notes_filename_with_last_user():
+    participants = [
+        {"user_id": "charlie", "display_name": "Charlie Brown"},
+        {"user_id": "alice", "display_name": "Alice Smith"},
+        {"user_id": "boss", "display_name": "Boss Man"},
+    ]
+    now = datetime(2026, 3, 11, 9, 15)
+    result = _build_notes_filename(participants, now, last_user="boss")
+    assert result == "2026-03-11-0915-alice-charlie-boss.md"
+
+
+def test_build_notes_filename_no_last_user():
+    participants = [
+        {"user_id": "bob", "display_name": "Bob Jones"},
+    ]
+    now = datetime(2026, 3, 11, 14, 30)
+    result = _build_notes_filename(participants, now, last_user="")
+    assert result == "2026-03-11-1430-bob.md"

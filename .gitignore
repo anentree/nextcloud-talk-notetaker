@@ -6,3 +6,6 @@ __pycache__/
 dist/
 build/
 .eggs/
+*.webm
+*.mp3
+notes/

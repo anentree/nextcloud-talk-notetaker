@@ -1,0 +1,14 @@
+services:
+  notetaker:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    shm_size: "1g"
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    tmpfs:
+      - /tmp/notetaker-audio
+    volumes:
+      - ./notes:/data/notes
