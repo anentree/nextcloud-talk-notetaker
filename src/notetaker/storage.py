@@ -19,11 +19,16 @@ def upload_notes(
     auth = (user, password)
     dav_base = f"{base}/remote.php/dav/files/{user}"
 
-    # Ensure folder exists (MKCOL -- 405 means already exists, that's fine)
-    folder_url = f"{dav_base}{folder}"
-    resp = requests.request("MKCOL", folder_url, auth=auth)
-    if resp.status_code not in (201, 405):
-        resp.raise_for_status()
+    # Ensure folder exists by creating each path segment (MKCOL doesn't
+    # create intermediate directories). 405 means already exists, that's fine.
+    parts = [p for p in folder.split("/") if p]
+    current = dav_base
+    for part in parts:
+        current = f"{current}/{part}"
+        resp = requests.request("MKCOL", current, auth=auth)
+        if resp.status_code not in (201, 405):
+            resp.raise_for_status()
+    folder_url = current
 
     # Upload file
     file_url = f"{folder_url}/{filename}"

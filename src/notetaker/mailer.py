@@ -47,6 +47,7 @@ def send_notes_email(
     subject: str,
     body: str,
     notes_markdown: str,
+    attachment_filename: str = "meeting-notes.md",
 ) -> None:
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -58,13 +59,19 @@ def send_notes_email(
         notes_markdown.encode("utf-8"),
         maintype="text",
         subtype="markdown",
-        filename="meeting-notes.md",
+        filename=attachment_filename,
     )
 
-    with smtplib.SMTP(smtp_host, smtp_port) as smtp:
-        if smtp_user and smtp_password:
-            smtp.starttls()
-            smtp.login(smtp_user, smtp_password)
-        smtp.send_message(msg)
+    if smtp_port == 465:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port) as smtp:
+            if smtp_user and smtp_password:
+                smtp.login(smtp_user, smtp_password)
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP(smtp_host, smtp_port) as smtp:
+            if smtp_user and smtp_password:
+                smtp.starttls()
+                smtp.login(smtp_user, smtp_password)
+            smtp.send_message(msg)
 
     log.info("Sent notes email to %s", [r["email"] for r in recipients])

@@ -11,23 +11,25 @@ def test_upload_notes_creates_folder_and_file():
     folder = "/Talk/Notes"
     filename = "2026-03-06-standup.md"
     notes_content = "# Meeting: Standup\n\n## Summary\nStuff happened."
+    dav_base = f"{NEXTCLOUD_URL}/remote.php/dav/files/{user}"
 
-    # MKCOL to create folder (may already exist -- 405 is OK)
-    responses.add(
-        "MKCOL",
-        f"{NEXTCLOUD_URL}/remote.php/dav/files/{user}{folder}",
-        status=405,
-    )
+    # MKCOL for each path segment (recursive creation)
+    responses.add("MKCOL", f"{dav_base}/Talk", status=405)
+    responses.add("MKCOL", f"{dav_base}/Talk/Notes", status=405)
 
     # PUT to upload file
     responses.add(
         responses.PUT,
-        f"{NEXTCLOUD_URL}/remote.php/dav/files/{user}{folder}/{filename}",
+        f"{dav_base}/Talk/Notes/{filename}",
         status=201,
     )
 
     upload_notes(NEXTCLOUD_URL, user, "secret", folder, filename, notes_content)
 
-    assert len(responses.calls) == 2
-    put_call = responses.calls[1]
+    assert len(responses.calls) == 3
+    assert responses.calls[0].request.method == "MKCOL"
+    assert responses.calls[0].request.url == f"{dav_base}/Talk"
+    assert responses.calls[1].request.method == "MKCOL"
+    assert responses.calls[1].request.url == f"{dav_base}/Talk/Notes"
+    put_call = responses.calls[2]
     assert put_call.request.body == notes_content.encode()
