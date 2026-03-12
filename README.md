@@ -41,7 +41,7 @@ The setup wizard will guide you through:
 
 Docker handles all internal dependencies (Python, ffmpeg, Chromium).
 
-## Nextcloud Admin Setup
+## Nextcloud User Setup
 
 ### 1. Create a bot user
 
@@ -115,7 +115,7 @@ Each call produces a markdown file with:
 
 ## Troubleshooting
 
-**Bot doesn't join calls**: Make sure the bot user is added as a participant in the Talk room.
+**Bot doesn't join calls unless it is added as a participant**: Make sure the bot user is added as a participant in the Talk room.
 
 **"Could not connect" during setup**: Verify the Nextcloud URL is correct and starts with `https://`.
 
