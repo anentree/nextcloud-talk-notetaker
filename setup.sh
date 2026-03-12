@@ -19,9 +19,9 @@ header()  { printf "\n${BOLD}${CYAN}── %s ──${NC}\n\n" "$*"; }
 prompt_value() {
     local prompt="$1" default="${2:-}"
     if [ -n "$default" ]; then
-        printf "${BOLD}%s${NC} [%s]: " "$prompt" "$default"
+        printf "${BOLD}%s${NC} [%s]: " "$prompt" "$default" >&2
     else
-        printf "${BOLD}%s${NC}: " "$prompt"
+        printf "${BOLD}%s${NC}: " "$prompt" >&2
     fi
     read -r value
     echo "${value:-$default}"
@@ -29,9 +29,9 @@ prompt_value() {
 
 prompt_secret() {
     local prompt="$1"
-    printf "${BOLD}%s${NC}: " "$prompt"
+    printf "${BOLD}%s${NC}: " "$prompt" >&2
     read -rs value
-    echo
+    echo >&2
     echo "$value"
 }
 
