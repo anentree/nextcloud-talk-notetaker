@@ -86,16 +86,7 @@ if command -v docker >/dev/null 2>&1; then
 else
     error "Docker is not installed."
     echo
-    case "$OS_NAME" in
-        ubuntu|debian)
-            info "Install with: sudo apt install docker.io docker-compose-plugin" ;;
-        fedora)
-            info "Install with: sudo dnf install docker docker-compose-plugin" ;;
-        arch|manjaro)
-            info "Install with: sudo pacman -S docker docker-compose" ;;
-        *)
-            info "Install from: https://docs.docker.com/engine/install/" ;;
-    esac
+    info "Install Docker Engine: https://docs.docker.com/engine/install/"
     echo
     exit 1
 fi
@@ -110,16 +101,9 @@ elif command -v docker-compose >/dev/null 2>&1; then
     success "Docker Compose v1 available"
 else
     error "Docker Compose is not installed."
-    case "$OS_NAME" in
-        ubuntu|debian)
-            info "Install with: sudo apt install docker-compose-plugin" ;;
-        fedora)
-            info "Install with: sudo dnf install docker-compose-plugin" ;;
-        arch|manjaro)
-            info "Install with: sudo pacman -S docker-compose" ;;
-        *)
-            info "Install from: https://docs.docker.com/compose/install/" ;;
-    esac
+    info "Docker Compose is included with Docker Engine from https://docs.docker.com/engine/install/"
+    info "If you installed Docker via your distro's package manager, also install the compose plugin:"
+    info "  https://docs.docker.com/compose/install/linux/"
     exit 1
 fi
 
