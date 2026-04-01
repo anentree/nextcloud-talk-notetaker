@@ -354,16 +354,18 @@ class AudioRecorder:
                 await page.wait_for_load_state("networkidle")
                 await asyncio.sleep(3)
             else:
-                # Standard Nextcloud login
+                # Standard Nextcloud login (Vue.js SPA — must wait for
+                # form elements to render, not just the page load event)
                 login_url = f"{self.nextcloud_url}/login"
                 await page.goto(login_url)
                 await page.wait_for_load_state("load")
-                await asyncio.sleep(3)
 
-                await page.fill(
-                    '#user, input[name="user"]',
-                    self.user,
-                )
+                # Wait for the Vue-rendered login form to appear
+                user_field = page.locator('#user, input[name="user"]')
+                await user_field.first.wait_for(state="visible", timeout=30000)
+                log.info("Login form rendered, filling credentials")
+
+                await user_field.first.fill(self.user)
                 await page.fill(
                     '#password, input[name="password"], input[type="password"]',
                     self.password,
@@ -372,7 +374,30 @@ class AudioRecorder:
                     '#submit-form, button[type="submit"], input[type="submit"]'
                 )
                 await page.wait_for_load_state("load")
-                await asyncio.sleep(3)
+
+                # Verify login succeeded: wait for redirect away from /login
+                # or for the user menu to appear (authenticated state)
+                for _check in range(10):
+                    await asyncio.sleep(2)
+                    current_url = page.url
+                    if "/login" not in current_url:
+                        log.info("Login succeeded, redirected to: %s", current_url)
+                        break
+                    # Check for login error messages
+                    error_el = page.locator('.warning, .error, [class*="error"]')
+                    try:
+                        if await error_el.first.is_visible(timeout=500):
+                            error_text = await error_el.first.text_content()
+                            raise RuntimeError(f"Nextcloud login failed: {error_text}")
+                    except RuntimeError:
+                        raise
+                    except Exception:
+                        pass
+                else:
+                    raise RuntimeError(
+                        f"Nextcloud login failed: still on login page after 20s "
+                        f"(URL: {page.url}). Check credentials for user '{self.user}'."
+                    )
 
             log.info("Login completed (%s), URL: %s", self.auth_method, page.url)
 
@@ -511,9 +536,13 @@ class AudioRecorder:
             # Wait for call to end by polling the Talk API.
             # Flush audio chunks to disk every 5 minutes to bound memory
             # usage for long calls (2+ hours).
+            # Grace period: require multiple consecutive "no participants"
+            # checks before ending, to handle brief reconnection gaps.
             auth = (self.user, self.password)
             poll_count = 0
             total_audio_bytes = 0
+            empty_streak = 0
+            grace_checks = 6  # 6 × 10s = 60s grace period
             while True:
                 await asyncio.sleep(10)
                 poll_count += 1
@@ -550,10 +579,28 @@ class AudioRecorder:
                         )
 
                 if not _others_in_call(self.nextcloud_url, auth, room_token, self.user):
-                    log.info(
-                        "Call ended in room %s (no other participants)", room_token
-                    )
-                    break
+                    empty_streak += 1
+                    if empty_streak == 1:
+                        log.info(
+                            "No other participants in room %s, starting grace period (%ds)",
+                            room_token,
+                            grace_checks * 10,
+                        )
+                    if empty_streak >= grace_checks:
+                        log.info(
+                            "Call ended in room %s (no participants for %ds)",
+                            room_token,
+                            empty_streak * 10,
+                        )
+                        break
+                else:
+                    if empty_streak > 0:
+                        log.info(
+                            "Participants returned to room %s after %ds empty, continuing",
+                            room_token,
+                            empty_streak * 10,
+                        )
+                    empty_streak = 0
 
             # Extract remaining recorded audio from the browser
             log.info("Extracting remaining audio from browser...")

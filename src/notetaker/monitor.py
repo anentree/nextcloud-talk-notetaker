@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import requests
 
 log = logging.getLogger(__name__)
+
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # seconds
 
 
 class CallMonitor:
@@ -16,13 +20,30 @@ class CallMonitor:
 
     def _get_rooms(self) -> list[dict[str, Any]]:
         url = f"{self.base_url}/ocs/v2.php/apps/spreed/api/v4/room"
-        resp = requests.get(
-            url,
-            auth=self.auth,
-            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
-        )
-        resp.raise_for_status()
-        return resp.json()["ocs"]["data"]
+        last_exc = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = requests.get(
+                    url,
+                    auth=self.auth,
+                    headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                return resp.json()["ocs"]["data"]
+            except Exception as exc:
+                last_exc = exc
+                if attempt < MAX_RETRIES:
+                    log.warning(
+                        "Failed to fetch rooms (attempt %d/%d): %s. Retrying in %ds...",
+                        attempt,
+                        MAX_RETRIES,
+                        exc,
+                        RETRY_DELAY,
+                    )
+                    time.sleep(RETRY_DELAY)
+        log.error("Failed to fetch rooms after %d attempts: %s", MAX_RETRIES, last_exc)
+        return []
 
     def check_for_new_calls(self) -> list[dict[str, Any]]:
         rooms = self._get_rooms()
@@ -38,3 +59,11 @@ class CallMonitor:
         self._active_tokens = currently_active
 
         return [r for r in rooms if r["token"] in new_calls]
+
+    def clear_token(self, token: str) -> None:
+        """Remove a token from the active set.
+
+        Call after handle_call finishes so that if the call is still ongoing,
+        it will be re-detected on the next poll cycle.
+        """
+        self._active_tokens.discard(token)

@@ -65,7 +65,18 @@ async def handle_call(cfg: Config, room: dict) -> None:
     )
     audio_path = await recorder.record_call(token, name)
 
-    # 2. Get participants (needed for filename and email)
+    # 2. Check audio is not empty
+    audio_size = os.path.getsize(audio_path)
+    if audio_size == 0:
+        log.warning("Empty audio file for room '%s' — skipping transcription", name)
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            pass
+        return
+    log.info("Audio file: %s (%d KB)", audio_path, audio_size // 1024)
+
+    # 3. Get participants (needed for filename and email)
     participants = get_participant_emails(
         cfg.nextcloud_url,
         cfg.nextcloud_user,
@@ -76,12 +87,12 @@ async def handle_call(cfg: Config, room: dict) -> None:
         exclude_user=cfg.nextcloud_user,
     )
 
-    # 3. Transcribe + summarize
+    # 4. Transcribe + summarize
     notes = transcribe_and_summarize(
         cfg.gemini_api_key, audio_path, name, model=cfg.gemini_model
     )
 
-    # 4. Save notes
+    # 5. Save notes
     filename = _build_notes_filename(
         participants, call_start, last_user=cfg.filename_last_user
     )
@@ -101,7 +112,7 @@ async def handle_call(cfg: Config, room: dict) -> None:
             notes,
         )
 
-    # 5. Email participants
+    # 6. Email participants
     try:
         if participants:
             subject, body = extract_follow_up_email(notes)
@@ -122,8 +133,12 @@ async def handle_call(cfg: Config, room: dict) -> None:
     except Exception:
         log.exception("Failed to send email for room %s (notes still uploaded)", token)
 
-    # 6. Keep audio file for now (debug -- remove this later)
-    log.info("Audio file kept for inspection: %s", audio_path)
+    # 7. Clean up audio file
+    try:
+        os.unlink(audio_path)
+        log.info("Cleaned up audio file: %s", audio_path)
+    except OSError:
+        log.warning("Failed to clean up audio file: %s", audio_path)
     log.info("Done processing call in room '%s'", name)
 
 
@@ -173,6 +188,10 @@ def main() -> None:
                         room.get("displayName"),
                         room["token"],
                     )
+                finally:
+                    # Clear from active set so if the call is still ongoing
+                    # (e.g. we left early), it gets re-detected next poll
+                    monitor.clear_token(room["token"])
         except Exception:
             log.exception("Error in poll cycle")
 
