@@ -63,7 +63,8 @@ async def handle_call(cfg: Config, room: dict) -> None:
         cfg.audio_dir,
         auth_method=cfg.auth_method,
     )
-    audio_path = await recorder.record_call(token, name)
+    audio_path, speaker_events = await recorder.record_call(token, name)
+    log.info("Captured %d speaker events for room '%s'", len(speaker_events), name)
 
     # 2. Check audio is not empty
     audio_size = os.path.getsize(audio_path)
@@ -89,7 +90,11 @@ async def handle_call(cfg: Config, room: dict) -> None:
 
     # 4. Transcribe + summarize
     notes = transcribe_and_summarize(
-        cfg.gemini_api_key, audio_path, name, model=cfg.gemini_model
+        cfg.gemini_api_key,
+        audio_path,
+        name,
+        model=cfg.gemini_model,
+        speaker_events=speaker_events,
     )
 
     # 5. Save notes

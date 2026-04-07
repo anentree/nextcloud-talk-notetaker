@@ -27,7 +27,78 @@ AUDIO_CAPTURE_INIT_JS = """
     window.__notetaker_gum_count = 0;
     window.__notetaker_wrapped_pcs = new WeakSet();
 
-    function startRecordingAudioTrack(track) {
+    // === SPEAKER TIMELINE (per-track VAD) ===
+    window.__nt_timeline = [];   // {streamId, startMs, endMs}
+    window.__nt_t0 = null;
+    window.__nt_peers = {};      // streamId -> {analyser, active, startedAt, belowSince}
+    window.__nt_streamEl = {};   // streamId -> <video> element (for name lookup via DOM)
+    window.__nt_vadInterval = null;
+    const VAD_THRESHOLD = 0.02;  // RMS threshold (0..1)
+    const VAD_HANGOVER_MS = 400; // silence duration that ends an utterance
+
+    function startVadLoop() {
+        if (window.__nt_vadInterval) return;
+        window.__nt_vadInterval = setInterval(() => {
+            const now = performance.now();
+            if (window.__nt_t0 === null) window.__nt_t0 = now;
+            for (const key of Object.keys(window.__nt_peers)) {
+                const peer = window.__nt_peers[key];
+                const buf = new Uint8Array(peer.analyser.fftSize);
+                peer.analyser.getByteTimeDomainData(buf);
+                let sumSq = 0;
+                for (let i = 0; i < buf.length; i++) {
+                    const v = (buf[i] - 128) / 128;
+                    sumSq += v * v;
+                }
+                const rms = Math.sqrt(sumSq / buf.length);
+                const speaking = rms > VAD_THRESHOLD;
+                if (speaking) {
+                    if (!peer.active) {
+                        peer.active = true;
+                        peer.startedAt = now;
+                    }
+                    peer.belowSince = null;
+                } else if (peer.active) {
+                    if (peer.belowSince === null) {
+                        peer.belowSince = now;
+                    } else if (now - peer.belowSince > VAD_HANGOVER_MS) {
+                        window.__nt_timeline.push({
+                            streamId: key,
+                            startMs: Math.round(peer.startedAt - window.__nt_t0),
+                            endMs: Math.round(peer.belowSince - window.__nt_t0),
+                        });
+                        peer.active = false;
+                        peer.belowSince = null;
+                    }
+                }
+            }
+        }, 100);
+    }
+
+    // Hook HTMLMediaElement.srcObject so we can map stream.id -> <video> element.
+    // Talk's UI always assigns remote streams to a <video> for rendering, and the
+    // surrounding DOM has the participant's display name next to it.
+    try {
+        const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
+        if (desc && desc.set) {
+            Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
+                configurable: true,
+                get: desc.get,
+                set(stream) {
+                    desc.set.call(this, stream);
+                    try {
+                        if (stream && stream.id) {
+                            window.__nt_streamEl[stream.id] = this;
+                        }
+                    } catch(e) {}
+                }
+            });
+        }
+    } catch(e) {
+        console.error('[notetaker] srcObject hook failed:', e);
+    }
+
+    function startRecordingAudioTrack(track, streamId) {
         const stream = new MediaStream([track]);
         try {
             if (!window.__notetaker_ctx) {
@@ -43,7 +114,20 @@ AUDIO_CAPTURE_INIT_JS = """
             }
             const source = window.__notetaker_ctx.createMediaStreamSource(stream);
             source.connect(window.__notetaker_dest);
-            console.log('[notetaker] Connected audio track to recording destination');
+            console.log('[notetaker] Connected audio track to recording destination (streamId=' + streamId + ')');
+
+            // Per-track analyser for the speaker timeline
+            if (streamId && !window.__nt_peers[streamId]) {
+                const analyser = window.__notetaker_ctx.createAnalyser();
+                analyser.fftSize = 512;
+                analyser.smoothingTimeConstant = 0.2;
+                source.connect(analyser);
+                window.__nt_peers[streamId] = {
+                    analyser, active: false, startedAt: 0, belowSince: null,
+                };
+                startVadLoop();
+                console.log('[notetaker] VAD analyser attached for stream ' + streamId);
+            }
 
             if (!window.__notetaker_recorder) {
                 const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
@@ -76,7 +160,8 @@ AUDIO_CAPTURE_INIT_JS = """
                 ' readyState=' + event.track.readyState +
                 ' (#' + window.__notetaker_track_count + ')');
             if (event.track.kind === 'audio') {
-                startRecordingAudioTrack(event.track);
+                const sid = (event.streams && event.streams[0]) ? event.streams[0].id : ('pc' + window.__notetaker_pc_count);
+                startRecordingAudioTrack(event.track, sid);
             }
         });
     }
@@ -214,6 +299,57 @@ async () => {
 }
 """
 
+# JavaScript to extract the speaker timeline + stream->displayName mapping via DOM.
+# Called once, after the call has ended.
+EXTRACT_TIMELINE_JS = """
+async () => {
+    // Flush any in-progress utterances
+    const now = performance.now();
+    for (const key of Object.keys(window.__nt_peers || {})) {
+        const peer = window.__nt_peers[key];
+        if (peer.active && window.__nt_t0 !== null) {
+            window.__nt_timeline.push({
+                streamId: key,
+                startMs: Math.round(peer.startedAt - window.__nt_t0),
+                endMs: Math.round(now - window.__nt_t0),
+            });
+            peer.active = false;
+        }
+    }
+
+    // Resolve stream.id -> display name by walking the DOM from the <video>
+    // element whose srcObject carries that stream.
+    const labels = {};
+    for (const streamId of Object.keys(window.__nt_streamEl || {})) {
+        const el = window.__nt_streamEl[streamId];
+        let name = null;
+        let node = el;
+        for (let depth = 0; depth < 10 && node; depth++) {
+            if (node.querySelector) {
+                const cand = node.querySelector('.nameIndicator, .participant-name, [class*="nameIndicator"], [class*="participantName"], [data-participant-name]');
+                if (cand && cand.textContent && cand.textContent.trim()) {
+                    name = cand.textContent.trim();
+                    break;
+                }
+                // Last-resort: any descendant element whose data-* attribute looks like a name
+                const dn = node.querySelector('[data-display-name]');
+                if (dn) {
+                    name = dn.getAttribute('data-display-name');
+                    if (name) break;
+                }
+            }
+            node = node.parentElement;
+        }
+        labels[streamId] = name;
+    }
+    return {
+        timeline: window.__nt_timeline || [],
+        labels: labels,
+        streamIds: Object.keys(window.__nt_peers || {}),
+    };
+}
+"""
+
 # JavaScript to stop recording and extract remaining audio as base64
 EXTRACT_AUDIO_JS = """
 async () => {
@@ -291,7 +427,9 @@ class AudioRecorder:
         filename = f"{date.today().isoformat()}-{slug}.webm"
         return os.path.join(self.audio_dir, filename)
 
-    async def record_call(self, room_token: str, conversation_name: str) -> str:
+    async def record_call(
+        self, room_token: str, conversation_name: str
+    ) -> tuple[str, list[dict]]:
         """Join a Talk call, record audio, return path to audio file.
 
         Blocks until the call ends (all other participants leave).
@@ -602,6 +740,69 @@ class AudioRecorder:
                         )
                     empty_streak = 0
 
+            # Extract speaker timeline BEFORE closing the recorder/browser —
+            # DOM and __nt_* state are still live here.
+            speaker_events: list[dict] = []
+            try:
+                tl = await page.evaluate(EXTRACT_TIMELINE_JS)
+                raw_events = tl.get("timeline", []) if tl else []
+                labels = tl.get("labels", {}) if tl else {}
+                log.info(
+                    "Speaker timeline: %d events across %d streams; DOM labels: %s",
+                    len(raw_events),
+                    len(tl.get("streamIds", []) if tl else []),
+                    {k: v for k, v in labels.items() if v},
+                )
+                # Fallback label assignment: if DOM scrape failed for a stream,
+                # fetch participants from Talk API and match by enumeration order.
+                unlabeled = [
+                    sid
+                    for sid in (tl.get("streamIds", []) if tl else [])
+                    if not labels.get(sid)
+                ]
+                if unlabeled:
+                    try:
+                        resp = requests.get(
+                            f"{self.nextcloud_url}/ocs/v2.php/apps/spreed/api/v4/room/{room_token}/participants",
+                            auth=(self.user, self.password),
+                            headers=OCS_HEADERS,
+                            timeout=10,
+                        )
+                        resp.raise_for_status()
+                        others = [
+                            p.get("displayName") or p.get("actorId")
+                            for p in resp.json()["ocs"]["data"]
+                            if p.get("actorType") == "users"
+                            and p.get("actorId") != self.user
+                        ]
+                        for i, sid in enumerate(unlabeled):
+                            if i < len(others):
+                                labels[sid] = others[i]
+                        log.info("Fallback ordinal labels applied: %s", labels)
+                    except Exception:
+                        log.warning("Ordinal label fallback failed", exc_info=True)
+
+                # Build speaker_events with resolved labels; unknowns -> Speaker N
+                sid_to_speaker: dict[str, str] = {}
+                speaker_counter = 0
+                for ev in raw_events:
+                    sid = ev.get("streamId")
+                    label = labels.get(sid)
+                    if not label:
+                        if sid not in sid_to_speaker:
+                            speaker_counter += 1
+                            sid_to_speaker[sid] = f"Speaker {speaker_counter}"
+                        label = sid_to_speaker[sid]
+                    speaker_events.append(
+                        {
+                            "start_ms": int(ev.get("startMs", 0)),
+                            "end_ms": int(ev.get("endMs", 0)),
+                            "label": label,
+                        }
+                    )
+            except Exception:
+                log.exception("Failed to extract speaker timeline")
+
             # Extract remaining recorded audio from the browser
             log.info("Extracting remaining audio from browser...")
             audio_b64 = await page.evaluate(EXTRACT_AUDIO_JS)
@@ -626,4 +827,4 @@ class AudioRecorder:
             with open(output_path, "wb") as f:
                 pass
 
-        return output_path
+        return output_path, speaker_events

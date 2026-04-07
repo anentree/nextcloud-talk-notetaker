@@ -22,7 +22,7 @@ def test_handle_call_pipeline(
     mock_unlink,
 ):
     mock_recorder = MagicMock()
-    mock_recorder.record_call = AsyncMock(return_value="/tmp/audio.wav")
+    mock_recorder.record_call = AsyncMock(return_value=("/tmp/audio.wav", []))
     mock_recorder_cls.return_value = mock_recorder
 
     mock_transcribe.return_value = "# Meeting: Standup\n\n## Summary\nGood stuff."
@@ -66,7 +66,7 @@ def test_handle_call_skips_empty_audio(
 ):
     """Empty audio file should skip transcription and email."""
     mock_recorder = MagicMock()
-    mock_recorder.record_call = AsyncMock(return_value="/tmp/audio.wav")
+    mock_recorder.record_call = AsyncMock(return_value=("/tmp/audio.wav", []))
     mock_recorder_cls.return_value = mock_recorder
 
     cfg = Config(
