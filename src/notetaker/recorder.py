@@ -33,8 +33,11 @@ AUDIO_CAPTURE_INIT_JS = """
     window.__nt_peers = {};      // streamId -> {analyser, active, startedAt, belowSince}
     window.__nt_streamEl = {};   // streamId -> <video> element (for name lookup via DOM)
     window.__nt_vadInterval = null;
-    const VAD_THRESHOLD = 0.02;  // RMS threshold (0..1)
+    // VAD_THRESHOLD is templated from Python (env-configurable).
+    const VAD_THRESHOLD = __VAD_THRESHOLD__;
     const VAD_HANGOVER_MS = 400; // silence duration that ends an utterance
+    // Per-peer RMS stats for tuning visibility
+    window.__nt_rms_stats = {}; // streamId -> {sum, peak, count}
 
     function startVadLoop() {
         if (window.__nt_vadInterval) return;
@@ -43,14 +46,23 @@ AUDIO_CAPTURE_INIT_JS = """
             if (window.__nt_t0 === null) window.__nt_t0 = now;
             for (const key of Object.keys(window.__nt_peers)) {
                 const peer = window.__nt_peers[key];
-                const buf = new Uint8Array(peer.analyser.fftSize);
-                peer.analyser.getByteTimeDomainData(buf);
+                if (!peer.buf) peer.buf = new Uint8Array(peer.analyser.fftSize);
+                peer.analyser.getByteTimeDomainData(peer.buf);
                 let sumSq = 0;
-                for (let i = 0; i < buf.length; i++) {
-                    const v = (buf[i] - 128) / 128;
+                for (let i = 0; i < peer.buf.length; i++) {
+                    const v = (peer.buf[i] - 128) / 128;
                     sumSq += v * v;
                 }
-                const rms = Math.sqrt(sumSq / buf.length);
+                const rms = Math.sqrt(sumSq / peer.buf.length);
+                // Track RMS stats for tuning visibility
+                let stats = window.__nt_rms_stats[key];
+                if (!stats) {
+                    stats = { sum: 0, peak: 0, count: 0 };
+                    window.__nt_rms_stats[key] = stats;
+                }
+                stats.sum += rms;
+                if (rms > stats.peak) stats.peak = rms;
+                stats.count += 1;
                 const speaking = rms > VAD_THRESHOLD;
                 if (speaking) {
                     if (!peer.active) {
@@ -139,7 +151,10 @@ AUDIO_CAPTURE_INIT_JS = """
                     if (e.data.size > 0) window.__notetaker_chunks.push(e.data);
                 };
                 window.__notetaker_recorder.start(1000);
-                console.log('[notetaker] MediaRecorder started (' + mimeType + ')');
+                // Anchor speaker timeline t=0 to the moment audio recording starts
+                // (otherwise the timeline drifts ~100ms behind the audio file).
+                window.__nt_t0 = performance.now();
+                console.log('[notetaker] MediaRecorder started (' + mimeType + '), t0=' + window.__nt_t0);
             }
         } catch (err) {
             console.error('[notetaker] Audio capture error:', err);
@@ -303,6 +318,11 @@ async () => {
 # Called once, after the call has ended.
 EXTRACT_TIMELINE_JS = """
 async () => {
+    // Stop the VAD loop so it doesn't race with extraction
+    if (window.__nt_vadInterval) {
+        clearInterval(window.__nt_vadInterval);
+        window.__nt_vadInterval = null;
+    }
     // Flush any in-progress utterances
     const now = performance.now();
     for (const key of Object.keys(window.__nt_peers || {})) {
@@ -342,10 +362,21 @@ async () => {
         }
         labels[streamId] = name;
     }
+    // Per-peer RMS summary for threshold tuning visibility
+    const rmsSummary = {};
+    for (const k of Object.keys(window.__nt_rms_stats || {})) {
+        const s = window.__nt_rms_stats[k];
+        rmsSummary[k] = {
+            mean: s.count > 0 ? s.sum / s.count : 0,
+            peak: s.peak,
+            samples: s.count,
+        };
+    }
     return {
         timeline: window.__nt_timeline || [],
         labels: labels,
         streamIds: Object.keys(window.__nt_peers || {}),
+        rmsSummary: rmsSummary,
     };
 }
 """
@@ -375,6 +406,48 @@ def _slugify(name: str) -> str:
     slug = name.lower().strip()
     slug = re.sub(r"[^a-z0-9]+", "-", slug)
     return slug.strip("-")
+
+
+def resolve_stream_labels(
+    stream_ids: list[str],
+    dom_labels: dict[str, str | None],
+    other_participants: list[str],
+) -> tuple[dict[str, str], int, int, int]:
+    """Resolve stream IDs to display-name labels.
+
+    Returns (labels, dom_count, ordinal_count, speaker_n_count). Streams
+    that cannot be resolved are assigned "Speaker N" deterministically.
+
+    Rules:
+    - DOM labels win.
+    - Ordinal fallback is only applied when EXACTLY one stream is unlabeled
+      and exactly one participant name remains unclaimed (the unambiguous
+      case). Otherwise unlabeled streams become Speaker N — we never guess
+      among multiple plausible names.
+    """
+    labels: dict[str, str] = {}
+    for sid in stream_ids:
+        v = dom_labels.get(sid)
+        if v:
+            labels[sid] = v
+    dom_count = len(labels)
+
+    unlabeled = [sid for sid in stream_ids if sid not in labels]
+    claimed = set(labels.values())
+    remaining = [n for n in other_participants if n and n not in claimed]
+    ordinal_count = 0
+    if len(unlabeled) == 1 and len(remaining) == 1:
+        labels[unlabeled[0]] = remaining[0]
+        ordinal_count = 1
+
+    speaker_n = 0
+    counter = 0
+    for sid in stream_ids:
+        if sid not in labels:
+            counter += 1
+            labels[sid] = f"Speaker {counter}"
+            speaker_n += 1
+    return labels, dom_count, ordinal_count, speaker_n
 
 
 def _others_in_call(base_url: str, auth: tuple, room_token: str, own_user: str) -> bool:
@@ -457,8 +530,13 @@ class AudioRecorder:
             )
 
             # Inject audio capture script into every page in this context
-            # BEFORE Talk's JavaScript creates RTCPeerConnections
-            await context.add_init_script(AUDIO_CAPTURE_INIT_JS)
+            # BEFORE Talk's JavaScript creates RTCPeerConnections.
+            # VAD threshold is env-configurable for tuning per deployment.
+            vad_threshold = float(os.environ.get("NOTETAKER_VAD_THRESHOLD", "0.02"))
+            init_js = AUDIO_CAPTURE_INIT_JS.replace(
+                "__VAD_THRESHOLD__", repr(vad_threshold)
+            )
+            await context.add_init_script(init_js)
 
             page = await context.new_page()
 
@@ -746,21 +824,27 @@ class AudioRecorder:
             try:
                 tl = await page.evaluate(EXTRACT_TIMELINE_JS)
                 raw_events = tl.get("timeline", []) if tl else []
-                labels = tl.get("labels", {}) if tl else {}
+                labels = dict(tl.get("labels", {}) if tl else {})
+                stream_ids = list(tl.get("streamIds", []) if tl else [])
+                rms_summary = tl.get("rmsSummary", {}) if tl else {}
                 log.info(
                     "Speaker timeline: %d events across %d streams; DOM labels: %s",
                     len(raw_events),
-                    len(tl.get("streamIds", []) if tl else []),
+                    len(stream_ids),
                     {k: v for k, v in labels.items() if v},
                 )
-                # Fallback label assignment: if DOM scrape failed for a stream,
-                # fetch participants from Talk API and match by enumeration order.
-                unlabeled = [
-                    sid
-                    for sid in (tl.get("streamIds", []) if tl else [])
-                    if not labels.get(sid)
-                ]
-                if unlabeled:
+                if rms_summary:
+                    log.info(
+                        "Per-stream RMS (threshold=%s): %s",
+                        vad_threshold,
+                        {
+                            k: f"mean={v.get('mean', 0):.4f} peak={v.get('peak', 0):.4f} n={v.get('samples', 0)}"
+                            for k, v in rms_summary.items()
+                        },
+                    )
+                # Resolve unlabeled streams via the Talk participants API.
+                others: list[str] = []
+                if any(not labels.get(sid) for sid in stream_ids):
                     try:
                         resp = requests.get(
                             f"{self.nextcloud_url}/ocs/v2.php/apps/spreed/api/v4/room/{room_token}/participants",
@@ -775,24 +859,31 @@ class AudioRecorder:
                             if p.get("actorType") == "users"
                             and p.get("actorId") != self.user
                         ]
-                        for i, sid in enumerate(unlabeled):
-                            if i < len(others):
-                                labels[sid] = others[i]
-                        log.info("Fallback ordinal labels applied: %s", labels)
                     except Exception:
-                        log.warning("Ordinal label fallback failed", exc_info=True)
+                        log.warning("Talk participants fetch failed", exc_info=True)
 
-                # Build speaker_events with resolved labels; unknowns -> Speaker N
-                sid_to_speaker: dict[str, str] = {}
-                speaker_counter = 0
+                labels, dom_n, ord_n, speaker_n = resolve_stream_labels(
+                    stream_ids, labels, others
+                )
+                log.info(
+                    "Label resolution: dom=%d ordinal=%d speaker_n=%d -> %s",
+                    dom_n,
+                    ord_n,
+                    speaker_n,
+                    labels,
+                )
+
+                # Build speaker_events. Any streamId not in `labels` (e.g. an
+                # event from a stream that vanished before extraction) gets a
+                # safe Speaker N label.
+                fallback_counter = 0
                 for ev in raw_events:
                     sid = ev.get("streamId")
                     label = labels.get(sid)
                     if not label:
-                        if sid not in sid_to_speaker:
-                            speaker_counter += 1
-                            sid_to_speaker[sid] = f"Speaker {speaker_counter}"
-                        label = sid_to_speaker[sid]
+                        fallback_counter += 1
+                        label = f"Speaker {fallback_counter}"
+                        labels[sid] = label
                     speaker_events.append(
                         {
                             "start_ms": int(ev.get("startMs", 0)),
