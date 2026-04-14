@@ -22,12 +22,13 @@ FALLBACK_MODEL = "gemini-2.5-flash"  # stronger model for retries
 SEGMENT_PROMPT = """You are a professional meeting transcriber. This audio is segment {seg_num} of {total_segs} from a Nextcloud Talk call named "{conversation_name}" on {date}.
 
 This segment covers approximately minutes {start_min} to {end_min} of the call.
-{timeline_block}
+{participants_block}{timeline_block}
 CRITICAL RULES:
 - Transcribe EVERYTHING said in this segment. Be thorough — do not skip or summarize.
 - Only include words that were ACTUALLY SPOKEN. Do NOT invent or hallucinate dialogue.
 - If the audio is silent or unintelligible, respond with: "[NO SPEECH IN THIS SEGMENT]"
-- Speaker attribution is PREDETERMINED by the SPEAKER TIMELINE above (if present). It was derived from separate per-participant audio streams and is ground truth. For every utterance, attribute it to the speaker whose interval contains its timestamp. NEVER infer speakers from voice characteristics, accent, or context — only use the timeline. If no timeline is provided, use Speaker 1, Speaker 2, etc. and be consistent.
+- If a SPEAKER TIMELINE is provided above, use it as the primary guide for speaker attribution — it was derived from separate per-participant audio tracks and is highly reliable. Attribute utterances to the speaker whose interval contains the timestamp.
+- If the timeline labels are generic (e.g. "Speaker 1") or absent, use voice characteristics, context, and the KNOWN PARTICIPANTS list to identify who is speaking. Be consistent with speaker identity across the transcript.
 - If an interval is marked `[overlap]`, note crosstalk between the listed speakers.
 - Use today's date ({date}) for any date references.
 
@@ -42,13 +43,14 @@ Produce a detailed transcript of this segment in this format:
 """
 
 SYNTHESIS_PROMPT = """You are a professional meeting note-taker. Below are detailed transcripts from all segments of a {duration_min}-minute Nextcloud Talk call named "{conversation_name}" on {date}.
-{timeline_block}
+{participants_block}{timeline_block}
 Your job is to synthesize these segment transcripts into comprehensive, well-structured meeting notes.
 
 CRITICAL RULES:
 - Use ONLY information from the transcripts below. Do NOT invent or add anything not present.
 - Cover the ENTIRE call chronologically — every topic, decision, and action item.
-- Use speaker names EXACTLY as they appear in the SPEAKER TIMELINE (if present). That timeline is ground truth for who said what. Do not re-attribute utterances based on voice characteristics.
+- Use speaker names from the SPEAKER TIMELINE and KNOWN PARTICIPANTS list. If the timeline has named speakers, use those names. If the timeline has generic labels (Speaker 1, etc.), use context from the transcripts and participant list to identify speakers.
+- ALL known participants should appear in the notes. Do not omit anyone from the participant list.
 - If the transcripts mention specific numbers, dates, names, or amounts — use them exactly.
 
 Produce the notes in this markdown format:
@@ -115,6 +117,17 @@ Be thorough — this is the official record of the meeting. Every topic discusse
 
 {segments}
 """
+
+
+def _format_participants_block(names: list[str] | None) -> str:
+    """Format participant names into a block for the prompt."""
+    if not names:
+        return ""
+    return (
+        "\nKNOWN PARTICIPANTS (from call roster — all were in the call):\n"
+        + ", ".join(names)
+        + "\n"
+    )
 
 
 def _fmt_ts(ms: int) -> str:
@@ -347,6 +360,7 @@ def _transcribe_chunk(
     today: str,
     model: str = "gemini-2.5-flash-lite",
     speaker_events: list[dict] | None = None,
+    participant_names: list[str] | None = None,
 ) -> str:
     """Transcribe a single audio chunk."""
     with open(chunk_path, "rb") as f:
@@ -363,6 +377,7 @@ def _transcribe_chunk(
         start_min=int(start_sec / 60),
         end_min=int(end_sec / 60),
         timeline_block=timeline_block,
+        participants_block=_format_participants_block(participant_names),
     )
 
     log.info(
@@ -393,6 +408,7 @@ def transcribe_and_summarize(
     conversation_name: str,
     model: str = "gemini-2.5-flash-lite",
     speaker_events: list[dict] | None = None,
+    participant_names: list[str] | None = None,
 ) -> str:
     """Transcribe audio via chunked pipeline: split → transcribe segments → synthesize notes."""
     client = genai.Client(api_key=api_key)
@@ -413,6 +429,7 @@ def transcribe_and_summarize(
             duration,
             model=model,
             speaker_events=speaker_events,
+            participant_names=participant_names,
         )
 
     # Long recordings: chunked pipeline
@@ -440,6 +457,7 @@ def transcribe_and_summarize(
                 today,
                 model=model,
                 speaker_events=speaker_events,
+                participant_names=participant_names,
             )
 
             # Quality gate: check transcript density (chars per minute)
@@ -467,6 +485,7 @@ def transcribe_and_summarize(
                     today,
                     model=model,
                     speaker_events=speaker_events,
+                    participant_names=participant_names,
                 )
                 chars_per_min = len(text) / max(chunk_duration_min, 0.1)
 
@@ -491,6 +510,7 @@ def transcribe_and_summarize(
                         today,
                         model=FALLBACK_MODEL,
                         speaker_events=speaker_events,
+                        participant_names=participant_names,
                     )
                     chars_per_min = len(text) / max(chunk_duration_min, 0.1)
                     if (
@@ -524,6 +544,7 @@ def transcribe_and_summarize(
             duration_min=int(duration / 60),
             segments=all_segments,
             timeline_block=_format_timeline_block(speaker_events),
+            participants_block=_format_participants_block(participant_names),
         )
 
         notes = _gemini_call(
@@ -553,6 +574,7 @@ def _single_pass_transcribe(
     duration: float,
     model: str = "gemini-2.5-flash-lite",
     speaker_events: list[dict] | None = None,
+    participant_names: list[str] | None = None,
 ) -> str:
     """Single-pass transcription for short recordings. Converts to MP3 first."""
     # Convert to MP3 for reliability (webm format causes issues with Gemini)
@@ -584,6 +606,7 @@ def _single_pass_transcribe(
             duration_min=int(duration / 60),
             segments="[Single recording — no segmentation needed. Transcribe and produce notes directly from the audio.]",
             timeline_block=_format_timeline_block(speaker_events),
+            participants_block=_format_participants_block(participant_names),
         )
 
         log.info("Single-pass: sending %d KB MP3 to Gemini", len(audio_bytes) / 1024)

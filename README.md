@@ -19,7 +19,7 @@ The bot joins calls as a regular participant, captures remote audio through in-b
 ## Quick Start
 
 ```bash
-git clone https://github.com/your-user/nextcloud-talk-notetaker.git
+git clone https://github.com/anentree/nextcloud-talk-notetaker.git
 cd nextcloud-talk-notetaker
 ./setup.sh
 ```
@@ -109,6 +109,7 @@ Each call produces a markdown file with:
 ## Architecture Notes
 
 - **Audio capture**: In-browser WebRTC interception via Playwright. No PulseAudio needed.
+- **Speaker attribution**: Per-track voice activity detection (VAD) with signaling-based identity. The bot intercepts HPB WebSocket messages to map each audio track to the participant who sent it — works reliably for calls of any size. Falls back to DOM scraping and Talk API if signaling is unavailable (e.g., non-HPB deployments).
 - **Transcription**: Chunked pipeline — long recordings (>10 min) are split into 15-minute MP3 segments, each transcribed separately, then synthesized into final notes.
 - **Muting**: The bot uses synthetic silent audio/black video streams so other participants don't hear Chrome's fake device beep.
 - **Gemini cost**: ~$0.02 per 30-minute call on Flash Lite. Free tier (1000 req/day) is sufficient for most teams.

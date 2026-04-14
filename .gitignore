@@ -9,3 +9,7 @@ build/
 *.webm
 *.mp3
 notes/
+.workflow/
+.ruff_cache/
+.pytest_cache/
+docs/superpowers/

@@ -28,16 +28,101 @@ AUDIO_CAPTURE_INIT_JS = """
     window.__notetaker_wrapped_pcs = new WeakSet();
 
     // === SPEAKER TIMELINE (per-track VAD) ===
-    window.__nt_timeline = [];   // {streamId, startMs, endMs}
+    window.__nt_timeline = [];   // {trackKey, startMs, endMs}
     window.__nt_t0 = null;
-    window.__nt_peers = {};      // streamId -> {analyser, active, startedAt, belowSince}
-    window.__nt_streamEl = {};   // streamId -> <video> element (for name lookup via DOM)
+    window.__nt_peers = {};      // trackKey -> {analyser, active, startedAt, belowSince}
+    window.__nt_trackEl = {};    // trackId -> <video> element (for name lookup via DOM)
     window.__nt_vadInterval = null;
     // VAD_THRESHOLD is templated from Python (env-configurable).
     const VAD_THRESHOLD = __VAD_THRESHOLD__;
     const VAD_HANGOVER_MS = 400; // silence duration that ends an utterance
     // Per-peer RMS stats for tuning visibility
-    window.__nt_rms_stats = {}; // streamId -> {sum, peak, count}
+    window.__nt_rms_stats = {}; // trackKey -> {sum, peak, count}
+
+    // === SIGNALING-BASED SPEAKER IDENTITY ===
+    // Maps built from intercepted HPB WebSocket messages.
+    // These provide authoritative track→participant mapping without DOM scraping.
+    window.__nt_sigMap = {};        // sessionId -> {userId, displayName}
+    window.__nt_sdpToSession = {};  // sdpFingerprint -> sessionId
+    window.__nt_trackToSession = {}; // trackKey -> sessionId
+
+    function processSignalingMessage(rawData) {
+        let msg;
+        try { msg = JSON.parse(rawData); } catch(e) { return; }
+
+        // Room join events: sessionId -> userId + displayName
+        if (msg.type === 'event' && msg.event) {
+            if (msg.event.target === 'room' && msg.event.type === 'join' && msg.event.join) {
+                for (const user of msg.event.join) {
+                    if (user.sessionid) {
+                        const displayName = (user.user && (user.user.displayname || user.user.displayName))
+                            || user.userid || user.sessionid;
+                        window.__nt_sigMap[user.sessionid] = {
+                            userId: user.userid || null,
+                            displayName: displayName,
+                        };
+                        console.log('[notetaker] Signaling join: session=' + user.sessionid +
+                            ' userId=' + user.userid + ' name=' + displayName);
+                    }
+                }
+            }
+            // Participants update: may carry userId for sessions we've seen
+            if (msg.event.target === 'participants' && msg.event.update) {
+                const users = msg.event.update.users || msg.event.update.changed || [];
+                if (Array.isArray(users)) for (const user of users) {
+                    const sid = user.sessionId || user.sessionid;
+                    const uid = user.userId || user.userid;
+                    if (sid && uid && !window.__nt_sigMap[sid]) {
+                        window.__nt_sigMap[sid] = {
+                            userId: uid,
+                            displayName: uid,
+                        };
+                        console.log('[notetaker] Signaling participant: session=' + sid + ' userId=' + uid);
+                    }
+                }
+            }
+        }
+
+        // Offer messages: extract sender sessionId + SDP fingerprint
+        if (msg.type === 'message' && msg.message && msg.message.sender) {
+            const senderSession = msg.message.sender.sessionid;
+            if (senderSession) {
+                try {
+                    const data = typeof msg.message.data === 'string'
+                        ? JSON.parse(msg.message.data) : msg.message.data;
+                    if (data.type === 'offer' && data.payload && data.payload.sdp) {
+                        const fp = data.payload.sdp.substring(0, 200);
+                        // Cap map size to prevent unbounded growth from renegotiations
+                        const keys = Object.keys(window.__nt_sdpToSession);
+                        if (keys.length > 50) delete window.__nt_sdpToSession[keys[0]];
+                        window.__nt_sdpToSession[fp] = senderSession;
+                        console.log('[notetaker] Signaling offer: session=' + senderSession +
+                            ' sdpFp=' + fp.substring(0, 40) + '...');
+                    }
+                } catch(e) {}
+            }
+        }
+    }
+
+    // Intercept WebSocket construction to capture HPB signaling messages.
+    // Talk creates a WebSocket to the signaling server; we add a passive
+    // listener for incoming messages to extract participant identity.
+    const OrigWebSocket = window.WebSocket;
+    window.WebSocket = new Proxy(OrigWebSocket, {
+        construct(target, args) {
+            const ws = Reflect.construct(target, args);
+            const url = (args[0] || '').toString();
+            if (url.includes('/signaling')) {
+                console.log('[notetaker] Intercepting signaling WebSocket: ' + url);
+                ws.addEventListener('message', function(event) {
+                    try { processSignalingMessage(event.data); } catch(e) {}
+                });
+            } else {
+                console.log('[notetaker] Ignoring non-signaling WebSocket: ' + url);
+            }
+            return ws;
+        }
+    });
 
     function startVadLoop() {
         if (window.__nt_vadInterval) return;
@@ -75,7 +160,7 @@ AUDIO_CAPTURE_INIT_JS = """
                         peer.belowSince = now;
                     } else if (now - peer.belowSince > VAD_HANGOVER_MS) {
                         window.__nt_timeline.push({
-                            streamId: key,
+                            trackKey: key,
                             startMs: Math.round(peer.startedAt - window.__nt_t0),
                             endMs: Math.round(peer.belowSince - window.__nt_t0),
                         });
@@ -87,9 +172,11 @@ AUDIO_CAPTURE_INIT_JS = """
         }, 100);
     }
 
-    // Hook HTMLMediaElement.srcObject so we can map stream.id -> <video> element.
+    // Hook HTMLMediaElement.srcObject so we can map track.id -> <video> element.
     // Talk's UI always assigns remote streams to a <video> for rendering, and the
     // surrounding DOM has the participant's display name next to it.
+    // We map by track.id (not stream.id) because HPB/Janus SFU may reuse the same
+    // stream.id ("janus") for all participants, making stream-based mapping useless.
     try {
         const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
         if (desc && desc.set) {
@@ -99,8 +186,10 @@ AUDIO_CAPTURE_INIT_JS = """
                 set(stream) {
                     desc.set.call(this, stream);
                     try {
-                        if (stream && stream.id) {
-                            window.__nt_streamEl[stream.id] = this;
+                        if (stream) {
+                            stream.getTracks().forEach(t => {
+                                window.__nt_trackEl[t.id] = this;
+                            });
                         }
                     } catch(e) {}
                 }
@@ -110,7 +199,7 @@ AUDIO_CAPTURE_INIT_JS = """
         console.error('[notetaker] srcObject hook failed:', e);
     }
 
-    function startRecordingAudioTrack(track, streamId) {
+    function startRecordingAudioTrack(track, trackKey) {
         const stream = new MediaStream([track]);
         try {
             if (!window.__notetaker_ctx) {
@@ -126,19 +215,21 @@ AUDIO_CAPTURE_INIT_JS = """
             }
             const source = window.__notetaker_ctx.createMediaStreamSource(stream);
             source.connect(window.__notetaker_dest);
-            console.log('[notetaker] Connected audio track to recording destination (streamId=' + streamId + ')');
+            console.log('[notetaker] Connected audio track to recording destination (trackKey=' + trackKey + ')');
 
-            // Per-track analyser for the speaker timeline
-            if (streamId && !window.__nt_peers[streamId]) {
+            // Per-track analyser for the speaker timeline.
+            // Key by track.id (unique per audio track) instead of stream.id,
+            // because HPB/Janus SFU reuses stream.id "janus" for all participants.
+            if (trackKey && !window.__nt_peers[trackKey]) {
                 const analyser = window.__notetaker_ctx.createAnalyser();
                 analyser.fftSize = 512;
                 analyser.smoothingTimeConstant = 0.2;
                 source.connect(analyser);
-                window.__nt_peers[streamId] = {
+                window.__nt_peers[trackKey] = {
                     analyser, active: false, startedAt: 0, belowSince: null,
                 };
                 startVadLoop();
-                console.log('[notetaker] VAD analyser attached for stream ' + streamId);
+                console.log('[notetaker] VAD analyser attached for track ' + trackKey);
             }
 
             if (!window.__notetaker_recorder) {
@@ -171,12 +262,20 @@ AUDIO_CAPTURE_INIT_JS = """
 
         pc.addEventListener('track', (event) => {
             window.__notetaker_track_count++;
+            const streamId = (event.streams && event.streams[0]) ? event.streams[0].id : null;
+            const trackKey = event.track.id || streamId || ('pc' + window.__notetaker_pc_count);
             console.log('[notetaker] Track event: kind=' + event.track.kind +
                 ' readyState=' + event.track.readyState +
+                ' trackId=' + event.track.id +
+                ' streamId=' + streamId +
+                ' pcSession=' + (pc.__nt_sessionId || 'none') +
                 ' (#' + window.__notetaker_track_count + ')');
             if (event.track.kind === 'audio') {
-                const sid = (event.streams && event.streams[0]) ? event.streams[0].id : ('pc' + window.__notetaker_pc_count);
-                startRecordingAudioTrack(event.track, sid);
+                // Propagate signaling identity to track level
+                if (pc.__nt_sessionId) {
+                    window.__nt_trackToSession[trackKey] = pc.__nt_sessionId;
+                }
+                startRecordingAudioTrack(event.track, trackKey);
             }
         });
     }
@@ -194,6 +293,21 @@ AUDIO_CAPTURE_INIT_JS = """
         console.log('[notetaker] setRemoteDescription called, type=' +
             (desc ? desc.type : 'null'));
         hookPC(this);
+
+        // Correlate this PC with the signaling session that sent the offer.
+        // The SDP content is identical in the WebSocket message and here.
+        if (desc && desc.type === 'offer' && desc.sdp && !this.__nt_sessionId) {
+            const fp = desc.sdp.substring(0, 200);
+            const sessionId = window.__nt_sdpToSession[fp];
+            if (sessionId) {
+                this.__nt_sessionId = sessionId;
+                const info = window.__nt_sigMap[sessionId] || {};
+                console.log('[notetaker] PC→session: ' + sessionId +
+                    ' (' + (info.displayName || 'unknown') + ')');
+                delete window.__nt_sdpToSession[fp];
+            }
+        }
+
         return origSetRemote.apply(this, arguments);
     };
 
@@ -329,7 +443,7 @@ async () => {
         const peer = window.__nt_peers[key];
         if (peer.active && window.__nt_t0 !== null) {
             window.__nt_timeline.push({
-                streamId: key,
+                trackKey: key,
                 startMs: Math.round(peer.startedAt - window.__nt_t0),
                 endMs: Math.round(now - window.__nt_t0),
             });
@@ -337,11 +451,25 @@ async () => {
         }
     }
 
-    // Resolve stream.id -> display name by walking the DOM from the <video>
-    // element whose srcObject carries that stream.
-    const labels = {};
-    for (const streamId of Object.keys(window.__nt_streamEl || {})) {
-        const el = window.__nt_streamEl[streamId];
+    // === LABEL RESOLUTION (signaling > DOM) ===
+
+    // Primary: signaling-derived labels (authoritative)
+    const sigLabels = {};
+    let sigCount = 0;
+    for (const trackKey of Object.keys(window.__nt_trackToSession || {})) {
+        const sessionId = window.__nt_trackToSession[trackKey];
+        const info = window.__nt_sigMap[sessionId];
+        if (info && info.displayName) {
+            sigLabels[trackKey] = info.displayName;
+            sigCount++;
+        }
+    }
+
+    // Secondary: DOM-derived labels (fallback for tracks without signaling data)
+    const domLabels = {};
+    let domCount = 0;
+    for (const trackId of Object.keys(window.__nt_trackEl || {})) {
+        const el = window.__nt_trackEl[trackId];
         let name = null;
         let node = el;
         for (let depth = 0; depth < 10 && node; depth++) {
@@ -351,7 +479,6 @@ async () => {
                     name = cand.textContent.trim();
                     break;
                 }
-                // Last-resort: any descendant element whose data-* attribute looks like a name
                 const dn = node.querySelector('[data-display-name]');
                 if (dn) {
                     name = dn.getAttribute('data-display-name');
@@ -360,8 +487,21 @@ async () => {
             }
             node = node.parentElement;
         }
-        labels[streamId] = name;
+        if (name) {
+            domLabels[trackId] = name;
+            domCount++;
+        }
     }
+
+    // Merge: signaling wins, DOM fills gaps
+    const labels = {};
+    for (const trackKey of Object.keys(window.__nt_peers || {})) {
+        labels[trackKey] = sigLabels[trackKey] || domLabels[trackKey] || null;
+    }
+
+    console.log('[notetaker] Label resolution: signaling=' + sigCount +
+        ' dom=' + domCount + ' sigMap=' + JSON.stringify(window.__nt_sigMap));
+
     // Per-peer RMS summary for threshold tuning visibility
     const rmsSummary = {};
     for (const k of Object.keys(window.__nt_rms_stats || {})) {
@@ -375,8 +515,11 @@ async () => {
     return {
         timeline: window.__nt_timeline || [],
         labels: labels,
-        streamIds: Object.keys(window.__nt_peers || {}),
+        trackKeys: Object.keys(window.__nt_peers || {}),
         rmsSummary: rmsSummary,
+        sigLabels: sigLabels,
+        domLabels: domLabels,
+        sigMap: window.__nt_sigMap || {},
     };
 }
 """
@@ -410,27 +553,29 @@ def _slugify(name: str) -> str:
 
 def resolve_stream_labels(
     stream_ids: list[str],
-    dom_labels: dict[str, str | None],
+    known_labels: dict[str, str | None],
     other_participants: list[str],
 ) -> tuple[dict[str, str], int, int, int]:
-    """Resolve stream IDs to display-name labels.
+    """Resolve track/stream IDs to display-name labels.
 
-    Returns (labels, dom_count, ordinal_count, speaker_n_count). Streams
-    that cannot be resolved are assigned "Speaker N" deterministically.
+    Returns (labels, known_count, ordinal_count, speaker_n_count).
+
+    ``known_labels`` may contain labels from any source (signaling,
+    DOM scraping, etc.) — callers merge upstream before calling.
 
     Rules:
-    - DOM labels win.
-    - Ordinal fallback is only applied when EXACTLY one stream is unlabeled
+    - Known labels win (any non-None value).
+    - Ordinal fallback is only applied when EXACTLY one ID is unlabeled
       and exactly one participant name remains unclaimed (the unambiguous
-      case). Otherwise unlabeled streams become Speaker N — we never guess
+      case). Otherwise unlabeled IDs become Speaker N — we never guess
       among multiple plausible names.
     """
     labels: dict[str, str] = {}
     for sid in stream_ids:
-        v = dom_labels.get(sid)
+        v = known_labels.get(sid)
         if v:
             labels[sid] = v
-    dom_count = len(labels)
+    known_count = len(labels)
 
     unlabeled = [sid for sid in stream_ids if sid not in labels]
     claimed = set(labels.values())
@@ -447,7 +592,7 @@ def resolve_stream_labels(
             counter += 1
             labels[sid] = f"Speaker {counter}"
             speaker_n += 1
-    return labels, dom_count, ordinal_count, speaker_n
+    return labels, known_count, ordinal_count, speaker_n
 
 
 def _others_in_call(base_url: str, auth: tuple, room_token: str, own_user: str) -> bool:
@@ -825,65 +970,103 @@ class AudioRecorder:
                 tl = await page.evaluate(EXTRACT_TIMELINE_JS)
                 raw_events = tl.get("timeline", []) if tl else []
                 labels = dict(tl.get("labels", {}) if tl else {})
-                stream_ids = list(tl.get("streamIds", []) if tl else [])
+                track_keys = list(tl.get("trackKeys", []) if tl else [])
                 rms_summary = tl.get("rmsSummary", {}) if tl else {}
+                # Diagnostic only — labels dict already has signaling > DOM merge
+                sig_labels = tl.get("sigLabels", {}) if tl else {}
+                dom_labels_js = tl.get("domLabels", {}) if tl else {}
+                sig_map = tl.get("sigMap", {}) if tl else {}
                 log.info(
-                    "Speaker timeline: %d events across %d streams; DOM labels: %s",
+                    "Speaker timeline: %d events across %d tracks",
                     len(raw_events),
-                    len(stream_ids),
+                    len(track_keys),
+                )
+                log.info(
+                    "Signaling labels (%d): %s",
+                    len(sig_labels),
+                    sig_labels,
+                )
+                log.info(
+                    "DOM labels (%d): %s",
+                    len({k: v for k, v in (dom_labels_js or {}).items() if v}),
+                    {k: v for k, v in (dom_labels_js or {}).items() if v},
+                )
+                log.info(
+                    "Signaling session map: %s",
+                    sig_map,
+                )
+                log.info(
+                    "Merged labels: %s",
                     {k: v for k, v in labels.items() if v},
                 )
                 if rms_summary:
                     log.info(
-                        "Per-stream RMS (threshold=%s): %s",
+                        "Per-track RMS (threshold=%s): %s",
                         vad_threshold,
                         {
                             k: f"mean={v.get('mean', 0):.4f} peak={v.get('peak', 0):.4f} n={v.get('samples', 0)}"
                             for k, v in rms_summary.items()
                         },
                     )
-                # Resolve unlabeled streams via the Talk participants API.
+                # Always fetch participants to resolve userIds → displayNames
+                # and to fill gaps in signaling data.
                 others: list[str] = []
-                if any(not labels.get(sid) for sid in stream_ids):
-                    try:
-                        resp = requests.get(
-                            f"{self.nextcloud_url}/ocs/v2.php/apps/spreed/api/v4/room/{room_token}/participants",
-                            auth=(self.user, self.password),
-                            headers=OCS_HEADERS,
-                            timeout=10,
-                        )
-                        resp.raise_for_status()
-                        others = [
-                            p.get("displayName") or p.get("actorId")
-                            for p in resp.json()["ocs"]["data"]
-                            if p.get("actorType") == "users"
+                try:
+                    resp = requests.get(
+                        f"{self.nextcloud_url}/ocs/v2.php/apps/spreed/api/v4/room/{room_token}/participants",
+                        auth=(self.user, self.password),
+                        headers=OCS_HEADERS,
+                        timeout=10,
+                    )
+                    resp.raise_for_status()
+                    api_participants = resp.json()["ocs"]["data"]
+                    # Build userId → displayName lookup
+                    uid_to_name = {}
+                    for p in api_participants:
+                        if (
+                            p.get("actorType") == "users"
                             and p.get("actorId") != self.user
-                        ]
-                    except Exception:
-                        log.warning("Talk participants fetch failed", exc_info=True)
+                        ):
+                            uid = p.get("actorId", "")
+                            dn = p.get("displayName") or uid
+                            uid_to_name[uid] = dn
+                            others.append(dn)
+                    # Upgrade signaling labels: if a label matches a userId,
+                    # replace it with the proper displayName.
+                    for tk, name in list(labels.items()):
+                        if name and name in uid_to_name and name != uid_to_name[name]:
+                            labels[tk] = uid_to_name[name]
+                            log.info(
+                                "Upgraded label for track %s: %s → %s",
+                                tk,
+                                name,
+                                uid_to_name[name],
+                            )
+                except Exception:
+                    log.warning("Talk participants fetch failed", exc_info=True)
 
-                labels, dom_n, ord_n, speaker_n = resolve_stream_labels(
-                    stream_ids, labels, others
+                labels, known_n, ord_n, speaker_n = resolve_stream_labels(
+                    track_keys, labels, others
                 )
                 log.info(
-                    "Label resolution: dom=%d ordinal=%d speaker_n=%d -> %s",
-                    dom_n,
+                    "Label resolution: known=%d ordinal=%d speaker_n=%d -> %s",
+                    known_n,
                     ord_n,
                     speaker_n,
                     labels,
                 )
 
-                # Build speaker_events. Any streamId not in `labels` (e.g. an
-                # event from a stream that vanished before extraction) gets a
+                # Build speaker_events. Any trackKey not in `labels` (e.g. an
+                # event from a track that vanished before extraction) gets a
                 # safe Speaker N label.
                 fallback_counter = 0
                 for ev in raw_events:
-                    sid = ev.get("streamId")
-                    label = labels.get(sid)
+                    tk = ev.get("trackKey")
+                    label = labels.get(tk)
                     if not label:
                         fallback_counter += 1
                         label = f"Speaker {fallback_counter}"
-                        labels[sid] = label
+                        labels[tk] = label
                     speaker_events.append(
                         {
                             "start_ms": int(ev.get("startMs", 0)),

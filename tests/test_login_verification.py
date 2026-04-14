@@ -167,7 +167,7 @@ async def test_successful_login_proceeds():
                     "ctxState": "running",
                 },
                 # Extract speaker timeline
-                {"timeline": [], "labels": {}, "streamIds": []},
+                {"timeline": [], "labels": {}, "trackKeys": []},
                 # Extract audio
                 None,
             ]
@@ -213,7 +213,7 @@ async def test_login_waits_for_form_elements():
                     "trackCount": 1,
                     "ctxState": "running",
                 },
-                {"timeline": [], "labels": {}, "streamIds": []},
+                {"timeline": [], "labels": {}, "trackKeys": []},
                 None,
             ]
         )

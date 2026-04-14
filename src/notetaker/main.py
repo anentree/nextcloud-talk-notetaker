@@ -89,12 +89,14 @@ async def handle_call(cfg: Config, room: dict) -> None:
     )
 
     # 4. Transcribe + summarize
+    participant_names = [p["display_name"] for p in participants]
     notes = transcribe_and_summarize(
         cfg.gemini_api_key,
         audio_path,
         name,
         model=cfg.gemini_model,
         speaker_events=speaker_events,
+        participant_names=participant_names,
     )
 
     # 5. Save notes

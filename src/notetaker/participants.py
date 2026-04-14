@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from urllib.parse import urlparse
 
 import requests
@@ -8,6 +9,8 @@ import requests
 log = logging.getLogger(__name__)
 
 OCS_HEADERS = {"OCS-APIRequest": "true", "Accept": "application/json"}
+MAX_RETRIES = 3
+RETRY_DELAY = 5
 
 
 def _get_email_from_api(base: str, auth: tuple, uid: str) -> str:
@@ -41,13 +44,34 @@ def get_participant_emails(
     overrides = email_overrides or {}
     log.info("Email overrides: %s", overrides)
 
-    resp = requests.get(
-        f"{base}/ocs/v2.php/apps/spreed/api/v4/room/{room_token}/participants",
-        auth=auth,
-        headers=OCS_HEADERS,
-    )
-    resp.raise_for_status()
-    participants = resp.json()["ocs"]["data"]
+    participants = []
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(
+                f"{base}/ocs/v2.php/apps/spreed/api/v4/room/{room_token}/participants",
+                auth=auth,
+                headers=OCS_HEADERS,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            participants = resp.json()["ocs"]["data"]
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES:
+                log.warning(
+                    "Failed to get participants (attempt %d/%d): %s. Retrying...",
+                    attempt,
+                    MAX_RETRIES,
+                    exc,
+                )
+                time.sleep(RETRY_DELAY)
+    else:
+        log.error(
+            "Failed to get participants after %d attempts: %s", MAX_RETRIES, last_exc
+        )
+        return []
 
     # Determine fallback domain for email derivation
     fallback_domain = mail_domain or urlparse(nextcloud_url).hostname
