@@ -19,6 +19,25 @@ CHUNK_DURATION = 900  # 15 minutes per chunk
 MIN_CHARS_PER_MINUTE = 100  # quality gate: minimum transcript density
 FALLBACK_MODEL = "gemini-2.5-flash"  # stronger model for retries
 
+# A 15-minute segment of dense conversation transcribes to more than the 8192
+# default allowed. On 2026-08-25 successive segments returned 14887, 17529 and
+# 19350 chars — climbing toward the cap — and the next one came back with no
+# text part at all. Give a segment the same budget the synthesis step gets.
+SEGMENT_MAX_OUTPUT_TOKENS = 16384
+
+
+class EmptyGeminiResponse(RuntimeError):
+    """Gemini returned HTTP 200 but the candidate carried no text part.
+
+    `GenerateContentResponse.text` is typed Optional[str]: None is part of the
+    success contract, not an error path, so nothing is raised for the retry
+    loop to catch. It happens when the token budget is spent before any text
+    is emitted (finish_reason MAX_TOKENS), or when the candidate is withheld
+    (SAFETY, RECITATION). Turning it into an exception is what lets the
+    existing retry-and-fallback machinery see it.
+    """
+
+
 SEGMENT_PROMPT = """You are a professional meeting transcriber. This audio is segment {seg_num} of {total_segs} from a Nextcloud Talk call named "{conversation_name}" on {date}.
 
 This segment covers approximately minutes {start_min} to {end_min} of the call.
@@ -28,7 +47,8 @@ CRITICAL RULES:
 - Only include words that were ACTUALLY SPOKEN. Do NOT invent or hallucinate dialogue.
 - If the audio is silent or unintelligible, respond with: "[NO SPEECH IN THIS SEGMENT]"
 - If a SPEAKER TIMELINE is provided above, use it as the primary guide for speaker attribution — it was derived from separate per-participant audio tracks and is highly reliable. Attribute utterances to the speaker whose interval contains the timestamp.
-- If the timeline labels are generic (e.g. "Speaker 1") or absent, use voice characteristics, context, and the KNOWN PARTICIPANTS list to identify who is speaking. Be consistent with speaker identity across the transcript.
+- If the timeline labels are generic (e.g. "Speaker 1") or absent, separate speakers by voice and KEEP the generic labels ("Speaker 1", "Speaker 2"). Only use a real name when someone is addressed by name in the audio or introduces themselves. NEVER assign a name from the participant list just because it is on the list — an unnamed speaker must stay unnamed.
+- The number of distinct speakers is whatever you can actually hear. Do NOT try to match the length of the participant list. A two-person call with four people on the roster has TWO speakers.
 - If an interval is marked `[overlap]`, note crosstalk between the listed speakers.
 - Use today's date ({date}) for any date references.
 
@@ -49,8 +69,10 @@ Your job is to synthesize these segment transcripts into comprehensive, well-str
 CRITICAL RULES:
 - Use ONLY information from the transcripts below. Do NOT invent or add anything not present.
 - Cover the ENTIRE call chronologically — every topic, decision, and action item.
-- Use speaker names from the SPEAKER TIMELINE and KNOWN PARTICIPANTS list. If the timeline has named speakers, use those names. If the timeline has generic labels (Speaker 1, etc.), use context from the transcripts and participant list to identify speakers.
-- ALL known participants should appear in the notes. Do not omit anyone from the participant list.
+- Use speaker names from the SPEAKER TIMELINE. If the timeline has generic labels (Speaker 1, etc.), keep those generic labels unless the transcripts show the person being addressed by name.
+- NEVER attribute a statement or an action item to someone who does not appear in the segment transcripts. Attributing words to a person who was not on the call is the single worst error you can make here — it puts commitments in the mouths of people who never spoke.
+- The Participants line and every attribution must list ONLY people evidenced in the transcripts. The roster is not evidence. If only two people spoke, name two people, even if the roster lists more.
+- If you cannot tell who said something, write "Unattributed" rather than guessing a name.
 - If the transcripts mention specific numbers, dates, names, or amounts — use them exactly.
 
 Produce the notes in this markdown format:
@@ -124,9 +146,11 @@ def _format_participants_block(names: list[str] | None) -> str:
     if not names:
         return ""
     return (
-        "\nKNOWN PARTICIPANTS (from call roster — all were in the call):\n"
-        + ", ".join(names)
-        + "\n"
+        "\nPOSSIBLE PARTICIPANTS (room roster — NOT proof of attendance).\n"
+        "Some of these people may not have joined this call at all, and some "
+        "may have joined without speaking. Treat this only as a spelling guide "
+        "for names you can already hear. Never introduce a name from this list "
+        "unless the audio or timeline supports it:\n" + ", ".join(names) + "\n"
     )
 
 
@@ -303,6 +327,16 @@ def _split_to_chunks(
     return chunks
 
 
+def _finish_reason(response) -> str:
+    """Best-effort finish_reason for diagnostics; never raises."""
+    try:
+        candidate = (response.candidates or [None])[0]
+        reason = getattr(candidate, "finish_reason", None)
+        return str(getattr(reason, "name", reason) or "UNKNOWN")
+    except Exception:  # pragma: no cover - diagnostics must not mask the error
+        return "UNKNOWN"
+
+
 def _gemini_call(
     client: genai.Client,
     contents: list,
@@ -317,10 +351,17 @@ def _gemini_call(
                 contents=contents,
                 config=types.GenerateContentConfig(max_output_tokens=max_output_tokens),
             )
-            return response.text
+            text = response.text
+            if text is None:
+                raise EmptyGeminiResponse(
+                    "Gemini returned no text part "
+                    f"(finish_reason={_finish_reason(response)}, model={model}, "
+                    f"max_output_tokens={max_output_tokens})"
+                )
+            return text
         except Exception as exc:
             exc_str = str(exc).lower()
-            is_transient = any(
+            is_transient = isinstance(exc, EmptyGeminiResponse) or any(
                 s in exc_str
                 for s in [
                     "429",
@@ -395,11 +436,46 @@ def _transcribe_chunk(
             types.Part.from_bytes(data=audio_bytes, mime_type="audio/mpeg"),
             prompt,
         ],
+        max_output_tokens=SEGMENT_MAX_OUTPUT_TOKENS,
         model=model,
     )
 
     log.info("Segment %d/%d: %d chars", seg_num, total_segs, len(text))
     return text
+
+
+def _prepend_coverage_warning(
+    notes: str,
+    failed_segments: list[tuple[int, float, float, str]],
+    total_segments: int,
+) -> str:
+    """State plainly, at the top of the notes, which minutes are missing.
+
+    The synthesis prompt tells the model to use only what the transcripts
+    contain, so it silently omits the placeholder left by a failed segment.
+    That turns a partial transcript into notes that look complete. This adds
+    the disclosure in code, where it cannot be reasoned away.
+    """
+    if not failed_segments:
+        return notes
+
+    minutes = sum(int((end - start) / 60) for _, start, end, _ in failed_segments)
+    lines = [
+        "> **⚠ Incomplete transcript.** "
+        f"{len(failed_segments)} of {total_segments} segments "
+        f"(~{minutes} minutes) could not be transcribed, so the notes below "
+        "do not cover the whole call.",
+        ">",
+    ]
+    for seg_num, start, end, reason in failed_segments:
+        lines.append(
+            f"> - Segment {seg_num}: minutes {int(start / 60)}–{int(end / 60)} — {reason}"
+        )
+    lines.append(
+        "> \n> The recording is retained and can be reprocessed with "
+        "`python -m notetaker.reprocess`."
+    )
+    return "\n".join(lines) + "\n\n" + notes
 
 
 def transcribe_and_summarize(
@@ -409,9 +485,23 @@ def transcribe_and_summarize(
     model: str = "gemini-2.5-flash-lite",
     speaker_events: list[dict] | None = None,
     participant_names: list[str] | None = None,
+    heartbeat_fn=None,
 ) -> str:
-    """Transcribe audio via chunked pipeline: split → transcribe segments → synthesize notes."""
+    """Transcribe audio via chunked pipeline: split → transcribe segments → synthesize notes.
+
+    ``heartbeat_fn`` is called between chunks. Transcribing a long call takes
+    many minutes on the single-threaded poll loop, and without it the
+    container's healthcheck goes stale during normal operation.
+    """
     client = genai.Client(api_key=api_key)
+
+    def _beat():
+        if heartbeat_fn is not None:
+            try:
+                heartbeat_fn()
+            except Exception:
+                log.debug("Heartbeat callback failed", exc_info=True)
+
     today = date.today().isoformat()
 
     # Get duration
@@ -444,36 +534,18 @@ def transcribe_and_summarize(
 
         # Transcribe each chunk with quality validation
         segment_texts = []
+        # Segments that produced no transcript. The notes must say so: a gap
+        # the reader cannot see is worse than one they can plan around.
+        failed_segments: list[tuple[int, float, float, str]] = []
         for i, (chunk_path, start, end) in enumerate(chunks):
             chunk_duration_min = (end - start) / 60
-            text = _transcribe_chunk(
-                client,
-                chunk_path,
-                i + 1,
-                len(chunks),
-                start,
-                end,
-                conversation_name,
-                today,
-                model=model,
-                speaker_events=speaker_events,
-                participant_names=participant_names,
-            )
-
-            # Quality gate: check transcript density (chars per minute)
-            chars_per_min = len(text) / max(chunk_duration_min, 0.1)
-            if chars_per_min < MIN_CHARS_PER_MINUTE and "[NO SPEECH" not in text:
-                log.warning(
-                    "Segment %d/%d too sparse: %d chars for %.0f min (%.0f chars/min, "
-                    "threshold %d). Retrying with same model...",
-                    i + 1,
-                    len(chunks),
-                    len(text),
-                    chunk_duration_min,
-                    chars_per_min,
-                    MIN_CHARS_PER_MINUTE,
-                )
-                time.sleep(3)
+            _beat()
+            # A segment that cannot be transcribed must cost only itself.
+            # Before 2026-08-25 this exception escaped the loop and killed
+            # the whole meeting: three of six segments had already come back
+            # with 14887, 17529 and 19350 chars of good transcript, and all
+            # of it was discarded because segment 4 came back empty.
+            try:
                 text = _transcribe_chunk(
                     client,
                     chunk_path,
@@ -487,18 +559,22 @@ def transcribe_and_summarize(
                     speaker_events=speaker_events,
                     participant_names=participant_names,
                 )
-                chars_per_min = len(text) / max(chunk_duration_min, 0.1)
 
+                # Quality gate: check transcript density (chars per minute)
+                chars_per_min = len(text) / max(chunk_duration_min, 0.1)
                 if chars_per_min < MIN_CHARS_PER_MINUTE and "[NO SPEECH" not in text:
                     log.warning(
-                        "Segment %d/%d still sparse after retry: %.0f chars/min. "
-                        "Retrying with fallback model %s...",
+                        "Segment %d/%d too sparse: %d chars for %.0f min (%.0f chars/min, "
+                        "threshold %d). Retrying with same model...",
                         i + 1,
                         len(chunks),
+                        len(text),
+                        chunk_duration_min,
                         chars_per_min,
-                        FALLBACK_MODEL,
+                        MIN_CHARS_PER_MINUTE,
                     )
                     time.sleep(3)
+                    _beat()
                     text = _transcribe_chunk(
                         client,
                         chunk_path,
@@ -508,23 +584,66 @@ def transcribe_and_summarize(
                         end,
                         conversation_name,
                         today,
-                        model=FALLBACK_MODEL,
+                        model=model,
                         speaker_events=speaker_events,
                         participant_names=participant_names,
                     )
                     chars_per_min = len(text) / max(chunk_duration_min, 0.1)
+
                     if (
                         chars_per_min < MIN_CHARS_PER_MINUTE
                         and "[NO SPEECH" not in text
                     ):
                         log.warning(
-                            "Segment %d/%d still sparse after fallback: %.0f chars/min. "
-                            "Using best result available.",
+                            "Segment %d/%d still sparse after retry: %.0f chars/min. "
+                            "Retrying with fallback model %s...",
                             i + 1,
                             len(chunks),
                             chars_per_min,
+                            FALLBACK_MODEL,
                         )
+                        time.sleep(3)
+                        _beat()
+                        text = _transcribe_chunk(
+                            client,
+                            chunk_path,
+                            i + 1,
+                            len(chunks),
+                            start,
+                            end,
+                            conversation_name,
+                            today,
+                            model=FALLBACK_MODEL,
+                            speaker_events=speaker_events,
+                            participant_names=participant_names,
+                        )
+                        chars_per_min = len(text) / max(chunk_duration_min, 0.1)
+                        if (
+                            chars_per_min < MIN_CHARS_PER_MINUTE
+                            and "[NO SPEECH" not in text
+                        ):
+                            log.warning(
+                                "Segment %d/%d still sparse after fallback: %.0f chars/min. "
+                                "Using best result available.",
+                                i + 1,
+                                len(chunks),
+                                chars_per_min,
+                            )
 
+            except Exception as exc:
+                log.error(
+                    "Segment %d/%d could not be transcribed (%s). "
+                    "Continuing without it so the rest of the meeting survives.",
+                    i + 1,
+                    len(chunks),
+                    exc,
+                )
+                failed_segments.append((i + 1, start, end, str(exc)))
+                text = (
+                    f"[SEGMENT {i + 1} OF {len(chunks)} UNAVAILABLE — covers "
+                    f"minutes {int(start / 60)}-{int(end / 60)} of the call. "
+                    f"Transcription failed: {exc}]"
+                )
             segment_texts.append(text)
             # Brief pause between API calls to avoid rate limits
             if i < len(chunks) - 1:
@@ -551,7 +670,7 @@ def transcribe_and_summarize(
             client, [synthesis_prompt], max_output_tokens=16384, model=model
         )
         log.info("Final notes: %d chars", len(notes))
-        return notes
+        return _prepend_coverage_warning(notes, failed_segments, len(chunks))
 
     finally:
         # Cleanup chunk files

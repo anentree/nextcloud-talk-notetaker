@@ -6,10 +6,35 @@ services:
     shm_size: "1g"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+      # If your Nextcloud host uses split-horizon DNS, Docker resolves it to the
+      # public WAN IP and hairpin NAT fails. Pin it to the LAN address instead:
+      #   - "cloud.example.com:192.168.1.10"
     deploy:
       resources:
         limits:
           memory: 2g
+    # Without this the json-file driver grows without bound, and every
+    # forensic log line is destroyed on the next `compose up --build`.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "10"
+    # `restart: unless-stopped` only fires when the process exits. A wedged
+    # Chromium or a hung poll leaves the container Up with nothing happening;
+    # the heartbeat is what makes that state visible.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,sys,time; p=os.getenv('HEARTBEAT_FILE','/tmp/notetaker-heartbeat'); sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 5*int(os.getenv('POLL_INTERVAL_SECONDS','10')) + 120 else 1)",
+        ]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     tmpfs:
       - /tmp/notetaker-audio
     volumes:

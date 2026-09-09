@@ -31,7 +31,13 @@ AUDIO_CAPTURE_INIT_JS = """
     window.__nt_timeline = [];   // {trackKey, startMs, endMs}
     window.__nt_t0 = null;
     window.__nt_peers = {};      // trackKey -> {analyser, active, startedAt, belowSince}
-    window.__nt_trackEl = {};    // trackId -> <video> element (for name lookup via DOM)
+    // Map trackKey -> the actual MediaStreamTrack object, and record every
+    // (element, tracks) binding. DOM name lookup matches by track *identity*
+    // rather than by track.id, because Janus reuses ids like "janus0" across
+    // every subscriber peer connection.
+    window.__nt_keyToTrack = {};
+    window.__nt_elBindings = [];  // [{el, tracks}] most recent last
+    window.__nt_wsUrls = [];      // every WebSocket URL the page opened
     window.__nt_vadInterval = null;
     // VAD_THRESHOLD is templated from Python (env-configurable).
     const VAD_THRESHOLD = __VAD_THRESHOLD__;
@@ -112,7 +118,15 @@ AUDIO_CAPTURE_INIT_JS = """
         construct(target, args) {
             const ws = Reflect.construct(target, args);
             const url = (args[0] || '').toString();
-            if (url.includes('/signaling')) {
+            window.__nt_wsUrls.push(url);
+            // Match the standalone (HPB) signaling endpoint. Talk builds it as
+            // <signaling_server>/spreed, so a deployment configured with
+            // ".../standalone-signaling" yields ".../standalone-signaling/spreed"
+            // — which does NOT contain the substring "/signaling". Matching on
+            // that substring alone silently disabled signaling attribution.
+            const isSignaling = /^wss?:/i.test(url) &&
+                (/signaling/i.test(url) || /\\/spreed(\\/|\\?|$)/i.test(url));
+            if (isSignaling) {
                 console.log('[notetaker] Intercepting signaling WebSocket: ' + url);
                 ws.addEventListener('message', function(event) {
                     try { processSignalingMessage(event.data); } catch(e) {}
@@ -172,11 +186,14 @@ AUDIO_CAPTURE_INIT_JS = """
         }, 100);
     }
 
-    // Hook HTMLMediaElement.srcObject so we can map track.id -> <video> element.
-    // Talk's UI always assigns remote streams to a <video> for rendering, and the
-    // surrounding DOM has the participant's display name next to it.
-    // We map by track.id (not stream.id) because HPB/Janus SFU may reuse the same
-    // stream.id ("janus") for all participants, making stream-based mapping useless.
+    // Hook HTMLMediaElement.srcObject so we can map a track back to its <video>.
+    // Talk's UI assigns remote streams to a <video> for rendering, and the
+    // surrounding tile carries the participant's display name.
+    //
+    // We record the track OBJECTS, not their ids. Neither stream.id nor
+    // track.id is unique under an HPB/Janus SFU — every subscriber peer
+    // connection produces "janus0"/"janus1" — so an id-keyed map is
+    // last-writer-wins and collapses every participant onto one element.
     try {
         const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
         if (desc && desc.set) {
@@ -187,9 +204,14 @@ AUDIO_CAPTURE_INIT_JS = """
                     desc.set.call(this, stream);
                     try {
                         if (stream) {
-                            stream.getTracks().forEach(t => {
-                                window.__nt_trackEl[t.id] = this;
+                            window.__nt_elBindings.push({
+                                el: this,
+                                tracks: stream.getTracks(),
                             });
+                            // Bound growth across long calls with many re-mounts.
+                            if (window.__nt_elBindings.length > 200) {
+                                window.__nt_elBindings.shift();
+                            }
                         }
                     } catch(e) {}
                 }
@@ -217,9 +239,10 @@ AUDIO_CAPTURE_INIT_JS = """
             source.connect(window.__notetaker_dest);
             console.log('[notetaker] Connected audio track to recording destination (trackKey=' + trackKey + ')');
 
-            // Per-track analyser for the speaker timeline.
-            // Key by track.id (unique per audio track) instead of stream.id,
-            // because HPB/Janus SFU reuses stream.id "janus" for all participants.
+            // Per-track analyser for the speaker timeline. trackKey is
+            // namespaced by peer connection (see hookPC) because Janus reuses
+            // track ids across PCs — an unnamespaced key made this guard drop
+            // every participant after the first.
             if (trackKey && !window.__nt_peers[trackKey]) {
                 const analyser = window.__notetaker_ctx.createAnalyser();
                 analyser.fftSize = 512;
@@ -257,17 +280,23 @@ AUDIO_CAPTURE_INIT_JS = """
         if (window.__notetaker_wrapped_pcs.has(pc)) return;
         window.__notetaker_wrapped_pcs.add(pc);
         window.__notetaker_pc_count++;
-        console.log('[notetaker] Hooked PeerConnection #' + window.__notetaker_pc_count +
+        // Stable per-PC id. Track keys are namespaced with it so that two
+        // subscriber connections both reporting track.id "janus0" produce
+        // distinct keys ("1:janus0", "2:janus0") instead of colliding.
+        pc.__nt_pcId = window.__notetaker_pc_count;
+        console.log('[notetaker] Hooked PeerConnection #' + pc.__nt_pcId +
             ' signalingState=' + pc.signalingState);
 
         pc.addEventListener('track', (event) => {
             window.__notetaker_track_count++;
             const streamId = (event.streams && event.streams[0]) ? event.streams[0].id : null;
-            const trackKey = event.track.id || streamId || ('pc' + window.__notetaker_pc_count);
+            const rawId = event.track.id || streamId || 'a';
+            const trackKey = pc.__nt_pcId + ':' + rawId;
             console.log('[notetaker] Track event: kind=' + event.track.kind +
                 ' readyState=' + event.track.readyState +
                 ' trackId=' + event.track.id +
                 ' streamId=' + streamId +
+                ' trackKey=' + trackKey +
                 ' pcSession=' + (pc.__nt_sessionId || 'none') +
                 ' (#' + window.__notetaker_track_count + ')');
             if (event.track.kind === 'audio') {
@@ -275,6 +304,7 @@ AUDIO_CAPTURE_INIT_JS = """
                 if (pc.__nt_sessionId) {
                     window.__nt_trackToSession[trackKey] = pc.__nt_sessionId;
                 }
+                window.__nt_keyToTrack[trackKey] = event.track;
                 startRecordingAudioTrack(event.track, trackKey);
             }
         });
@@ -466,29 +496,84 @@ async () => {
     }
 
     // Secondary: DOM-derived labels (fallback for tracks without signaling data)
-    const domLabels = {};
-    let domCount = 0;
-    for (const trackId of Object.keys(window.__nt_trackEl || {})) {
-        const el = window.__nt_trackEl[trackId];
-        let name = null;
-        let node = el;
-        for (let depth = 0; depth < 10 && node; depth++) {
-            if (node.querySelector) {
-                const cand = node.querySelector('.nameIndicator, .participant-name, [class*="nameIndicator"], [class*="participantName"], [data-participant-name]');
-                if (cand && cand.textContent && cand.textContent.trim()) {
-                    name = cand.textContent.trim();
-                    break;
-                }
-                const dn = node.querySelector('[data-display-name]');
-                if (dn) {
-                    name = dn.getAttribute('data-display-name');
-                    if (name) break;
-                }
-            }
+    //
+    // The name must come from the tile that actually renders THIS track. The
+    // previous implementation climbed up to 10 ancestors calling querySelector
+    // at each level; once the climb reached the video grid, querySelector
+    // returned the first name in the whole grid, so every track got the same
+    // name. We now resolve the owning tile and refuse to look outside it.
+    const NAME_SELECTOR = '.nameIndicator, .participant-name, [class*="nameIndicator"], [class*="participantName"], [data-participant-name]';
+    const TILE_SELECTOR = '[class*="videoContainer"], [class*="videoWrapper"], [class*="participant"], [class*="Participant"]';
+
+    // Count NAME elements, not <video> elements, to decide whether a node is
+    // a single participant tile. Cameras are usually off on these calls, so
+    // Talk binds streams to <audio> and a video-based guard never trips —
+    // which reproduced the original "one name for every track" bug.
+    function spansMultipleParticipants(node) {
+        if (!node || !node.querySelectorAll) return false;
+        const names = node.querySelectorAll(NAME_SELECTOR).length;
+        if (names > 1) return true;
+        // Media count is only a fallback signal: a single tile legitimately
+        // holds both a <video> and an <audio> element, so counting media
+        // alone would reject valid tiles.
+        if (names === 0 && node.querySelectorAll('video, audio').length > 1) {
+            return true;
+        }
+        return false;
+    }
+
+    function tileFor(el) {
+        // Prefer an explicit tile ancestor — but only if it really is one
+        // tile. TILE_SELECTOR can also match the grid container (e.g.
+        // "participantsGrid"), which would hand back the wrong name or none.
+        if (el.closest) {
+            const t = el.closest(TILE_SELECTOR);
+            if (t && !spansMultipleParticipants(t)) return t;
+        }
+        // Otherwise climb, but stop before entering a container that spans
+        // more than one participant — that is the grid, not a tile.
+        let node = el.parentElement;
+        let best = null;
+        for (let d = 0; d < 5 && node; d++) {
+            if (spansMultipleParticipants(node)) break;
+            best = node;
             node = node.parentElement;
         }
+        return best;
+    }
+
+    function nameForElement(el) {
+        const tile = tileFor(el);
+        if (!tile || !tile.querySelector) return null;
+        // Guard against a container that spans several participants.
+        if (spansMultipleParticipants(tile)) return null;
+        const cand = tile.querySelector(NAME_SELECTOR);
+        if (cand && cand.textContent && cand.textContent.trim()) {
+            return cand.textContent.trim();
+        }
+        const dn = tile.querySelector('[data-display-name]');
+        const dnv = dn && dn.getAttribute('data-display-name');
+        return dnv || null;
+    }
+
+    const domLabels = {};
+    let domCount = 0;
+    const bindings = window.__nt_elBindings || [];
+    for (const trackKey of Object.keys(window.__nt_keyToTrack || {})) {
+        const track = window.__nt_keyToTrack[trackKey];
+        if (!track) continue;
+        // Most recent binding containing this exact track object wins.
+        let el = null;
+        for (let i = bindings.length - 1; i >= 0; i--) {
+            if (bindings[i].tracks && bindings[i].tracks.indexOf(track) !== -1) {
+                el = bindings[i].el;
+                break;
+            }
+        }
+        if (!el) continue;
+        const name = nameForElement(el);
         if (name) {
-            domLabels[trackId] = name;
+            domLabels[trackKey] = name;
             domCount++;
         }
     }
@@ -520,6 +605,7 @@ async () => {
         sigLabels: sigLabels,
         domLabels: domLabels,
         sigMap: window.__nt_sigMap || {},
+        wsUrls: window.__nt_wsUrls || [],
     };
 }
 """
@@ -555,16 +641,28 @@ def resolve_stream_labels(
     stream_ids: list[str],
     known_labels: dict[str, str | None],
     other_participants: list[str],
-) -> tuple[dict[str, str], int, int, int]:
+    authoritative_keys: set[str] | None = None,
+) -> tuple[dict[str, str], int, int, int, int]:
     """Resolve track/stream IDs to display-name labels.
 
-    Returns (labels, known_count, ordinal_count, speaker_n_count).
+    Returns (labels, known_count, ordinal_count, speaker_n_count, conflicts).
 
     ``known_labels`` may contain labels from any source (signaling,
     DOM scraping, etc.) — callers merge upstream before calling.
 
     Rules:
-    - Known labels win (any non-None value).
+    - Known labels win (any non-None value)...
+    - ...unless the same name was claimed by more than one track AND the
+      claim did not come from signaling. Guessed labels colliding means the
+      labelling source is wrong (two tracks cannot be the same person), so
+      every track involved is demoted to Speaker N. A confidently wrong name
+      is worse than an honest anonymous one: the transcriber prompt treats
+      the timeline as authoritative and will override its own voice-based
+      diarization with it.
+    - ``authoritative_keys`` are track keys whose label came from the
+      signaling server, which reports true identity. One person can
+      legitimately own several tracks there (a reconnect or renegotiation
+      creates a new peer connection), so those duplicates are kept.
     - Ordinal fallback is only applied when EXACTLY one ID is unlabeled
       and exactly one participant name remains unclaimed (the unambiguous
       case). Otherwise unlabeled IDs become Speaker N — we never guess
@@ -575,6 +673,70 @@ def resolve_stream_labels(
         v = known_labels.get(sid)
         if v:
             labels[sid] = v
+
+    # Demote any name claimed by more than one track, unless every claim to
+    # that name came from signaling (where one person really can own several
+    # tracks after a reconnect).
+    authoritative = authoritative_keys or set()
+    counts: dict[str, int] = {}
+    for name in labels.values():
+        counts[name] = counts.get(name, 0) + 1
+
+    trusted_names = {
+        name
+        for name in counts
+        if all(
+            sid in authoritative for sid, lbl in labels.items() if lbl == name
+        )
+    }
+
+    conflicts = 0
+
+    # Mixed case: signaling says track A is Piyush and DOM guesses the same
+    # name for track B. Signaling is authoritative everywhere else, so keep
+    # its claim and drop only the guess rather than losing both.
+    for name, count in list(counts.items()):
+        if count <= 1 or name in trusted_names:
+            continue
+        claimants = [sid for sid, lbl in labels.items() if lbl == name]
+        signalled = [sid for sid in claimants if sid in authoritative]
+        if len(signalled) == 1:
+            for sid in claimants:
+                if sid not in authoritative:
+                    del labels[sid]
+                    conflicts += 1
+            counts[name] = 1
+            trusted_names.add(name)
+            log.info(
+                "Name %r was claimed by signaling for track %s and guessed for "
+                "%d other track(s); keeping the signaling claim",
+                name,
+                signalled[0],
+                len(claimants) - 1,
+            )
+
+    for sid in list(labels):
+        name = labels[sid]
+        if counts.get(name, 0) > 1 and name not in trusted_names:
+            log.warning(
+                "Track %s and %d other track(s) both resolved to %r without "
+                "signaling confirmation — demoting all of them to anonymous "
+                "speakers rather than risk misattributing words",
+                sid,
+                counts[name] - 1,
+                name,
+            )
+            del labels[sid]
+            conflicts += 1
+        elif counts.get(name, 0) > 1:
+            log.info(
+                "Track %s shares the signaling-confirmed name %r with %d other "
+                "track(s) — same person across reconnects, keeping the label",
+                sid,
+                name,
+                counts[name] - 1,
+            )
+
     known_count = len(labels)
 
     unlabeled = [sid for sid in stream_ids if sid not in labels]
@@ -592,11 +754,31 @@ def resolve_stream_labels(
             counter += 1
             labels[sid] = f"Speaker {counter}"
             speaker_n += 1
-    return labels, known_count, ordinal_count, speaker_n
+    return labels, known_count, ordinal_count, speaker_n, conflicts
 
 
-def _others_in_call(base_url: str, auth: tuple, room_token: str, own_user: str) -> bool:
-    """Check via Talk API if any other participants are still in the call."""
+def _call_presence(
+    base_url: str, auth: tuple, room_token: str, own_user: str
+) -> tuple[set[str], int] | None:
+    """Return (registered user IDs in the call, total others in the call).
+
+    Returns None if the check itself failed, which callers must treat as
+    "unknown", not as "nobody is here".
+
+    The two values are deliberately different populations:
+
+    - The count includes guests and federated participants, because whether
+      the call is still running has nothing to do with whether an attendee
+      has a Nextcloud account. Filtering it to registered users would end a
+      recording while guests were still talking.
+    - The ID set contains only registered users, because that is who we can
+      resolve to an email address.
+
+    This is the only moment attendance is observable. Once a call ends every
+    participant's ``inCall`` flag resets to 0, so who was actually present
+    cannot be recovered afterwards — which is why the caller accumulates the
+    union of these sets across the whole call.
+    """
     try:
         resp = requests.get(
             f"{base_url}/ocs/v2.php/apps/spreed/api/v4/room/{room_token}/participants",
@@ -605,15 +787,29 @@ def _others_in_call(base_url: str, auth: tuple, room_token: str, own_user: str) 
             timeout=10,
         )
         resp.raise_for_status()
+        ids: set[str] = set()
+        total = 0
         for p in resp.json()["ocs"]["data"]:
-            if p.get("actorId") == own_user:
+            actor_id = p.get("actorId")
+            if actor_id == own_user:
                 continue
-            if p.get("inCall", 0) > 0:
-                return True
+            if not p.get("inCall", 0) > 0:
+                continue
+            total += 1
+            # actorType is absent on older Talk API responses; treat a missing
+            # value as a registered user rather than dropping the attendee.
+            if p.get("actorType", "users") == "users" and actor_id:
+                ids.add(actor_id)
+        return ids, total
     except Exception:
         log.warning("Failed to check call participants via API, assuming still active")
-        return True
-    return False
+        return None
+
+
+def _others_in_call(base_url: str, auth: tuple, room_token: str, own_user: str) -> bool:
+    """Check via Talk API if any other participants are still in the call."""
+    presence = _call_presence(base_url, auth, room_token, own_user)
+    return True if presence is None else presence[1] > 0
 
 
 class AudioRecorder:
@@ -645,15 +841,34 @@ class AudioRecorder:
         filename = f"{date.today().isoformat()}-{slug}.webm"
         return os.path.join(self.audio_dir, filename)
 
+    # Set by the caller so the recorder can prove liveness during a long call.
+    heartbeat_fn = None
+
     async def record_call(
         self, room_token: str, conversation_name: str
-    ) -> tuple[str, list[dict]]:
+    ) -> tuple[str, list[dict], set[str]]:
         """Join a Talk call, record audio, return path to audio file.
 
         Blocks until the call ends (all other participants leave).
         Uses in-browser MediaRecorder to capture WebRTC audio directly.
         """
         output_path = self._output_path(room_token, conversation_name)
+
+        # Audio is appended in 5-minute flushes. The filename is derived from
+        # the date and room, so a previous call in the same room on the same
+        # day that crashed mid-recording would leave a file here and this
+        # call would append to it — splicing two meetings into one recording.
+        # Start from a clean file every time.
+        if os.path.exists(output_path):
+            log.warning(
+                "Removing leftover recording from an earlier run: %s (%d bytes)",
+                output_path,
+                os.path.getsize(output_path),
+            )
+            try:
+                os.unlink(output_path)
+            except OSError:
+                log.exception("Could not remove leftover recording %s", output_path)
 
         from playwright.async_api import async_playwright
 
@@ -904,9 +1119,22 @@ class AudioRecorder:
             total_audio_bytes = 0
             empty_streak = 0
             grace_checks = 6  # 6 × 10s = 60s grace period
+            # Union of everyone seen in the call across its whole lifetime.
+            # Someone who joined for five minutes and left still attended.
+            attendee_ids: set[str] = set()
             while True:
                 await asyncio.sleep(10)
                 poll_count += 1
+
+                # Prove liveness while a call is in progress. The outer poll
+                # loop is blocked for the whole call, so without this the
+                # container reports unhealthy after a few minutes of every
+                # real meeting — the exact inverse of the intended signal.
+                if self.heartbeat_fn is not None:
+                    try:
+                        self.heartbeat_fn()
+                    except Exception:
+                        log.debug("Heartbeat callback failed", exc_info=True)
 
                 # Log diagnostics every 3rd poll (30s)
                 if poll_count % 3 == 1:
@@ -939,7 +1167,21 @@ class AudioRecorder:
                             total_audio_bytes,
                         )
 
-                if not _others_in_call(self.nextcloud_url, auth, room_token, self.user):
+                presence = _call_presence(
+                    self.nextcloud_url, auth, room_token, self.user
+                )
+                if presence is not None:
+                    current_ids, others_present = presence
+                    new_ids = current_ids - attendee_ids
+                    if new_ids:
+                        log.info("Attendees joined the call: %s", sorted(new_ids))
+                    attendee_ids |= current_ids
+                else:
+                    # The check failed — treat as "still active" rather than
+                    # ending the recording on a transient API error.
+                    others_present = 1
+
+                if not others_present:
                     empty_streak += 1
                     if empty_streak == 1:
                         log.info(
@@ -995,6 +1237,17 @@ class AudioRecorder:
                     "Signaling session map: %s",
                     sig_map,
                 )
+                # Logged at INFO deliberately: a signaling URL that no longer
+                # matches the interception filter is invisible otherwise, and
+                # that is exactly how attribution broke silently.
+                ws_urls = tl.get("wsUrls", []) if tl else []
+                log.info("WebSocket URLs observed (%d): %s", len(ws_urls), ws_urls)
+                if not sig_map:
+                    log.warning(
+                        "Signaling map is EMPTY — speaker identity fell back to DOM "
+                        "scraping. Check that one of the URLs above is the Talk "
+                        "signaling endpoint and matches the interception filter."
+                    )
                 log.info(
                     "Merged labels: %s",
                     {k: v for k, v in labels.items() if v},
@@ -1030,7 +1283,14 @@ class AudioRecorder:
                             uid = p.get("actorId", "")
                             dn = p.get("displayName") or uid
                             uid_to_name[uid] = dn
-                            others.append(dn)
+                            # `others` seeds the ordinal-name fallback, which
+                            # writes a real name into the timeline the
+                            # transcriber treats as ground truth. Only people
+                            # actually on the call may enter that pool —
+                            # otherwise a room member who never joined can be
+                            # named as a speaker.
+                            if not attendee_ids or uid in attendee_ids:
+                                others.append(dn)
                     # Upgrade signaling labels: if a label matches a userId,
                     # replace it with the proper displayName.
                     for tk, name in list(labels.items()):
@@ -1045,21 +1305,66 @@ class AudioRecorder:
                 except Exception:
                     log.warning("Talk participants fetch failed", exc_info=True)
 
-                labels, known_n, ord_n, speaker_n = resolve_stream_labels(
-                    track_keys, labels, others
+                # With no attendance evidence we cannot say who was on the
+                # call, so the ordinal fallback must not put a roster name on
+                # an unlabeled track — that is how a room member who never
+                # joined gets quoted. Anonymous labels only.
+                if not attendee_ids and others:
+                    log.warning(
+                        "No attendance data for room %s — suppressing the "
+                        "ordinal name fallback so no roster name is guessed "
+                        "onto a track",
+                        room_token,
+                    )
+                    others = []
+
+                labels, known_n, ord_n, speaker_n, conflicts = resolve_stream_labels(
+                    track_keys,
+                    labels,
+                    others,
+                    authoritative_keys=set(sig_labels or {}),
                 )
                 log.info(
-                    "Label resolution: known=%d ordinal=%d speaker_n=%d -> %s",
+                    "Label resolution: known=%d ordinal=%d speaker_n=%d conflicts=%d -> %s",
                     known_n,
                     ord_n,
                     speaker_n,
+                    conflicts,
                     labels,
                 )
 
+                # Sanity gate. If we captured fewer tracks than there were
+                # people ON THE CALL, the timeline covers only part of the
+                # room. Feeding that to the transcriber is actively harmful:
+                # the prompt calls the timeline "highly reliable" and lets it
+                # override the model's own voice diarization, so a partial
+                # timeline pins other people's words on whoever we did
+                # capture. Better to say nothing than to say something wrong.
+                #
+                # Compare against observed ATTENDEES, not room membership. A
+                # two-person call in a four-member room is complete with two
+                # tracks; comparing against the roster would discard a
+                # perfectly good timeline on most real calls.
+                expected = len(attendee_ids) if attendee_ids else 0
+                if expected and len(track_keys) < expected:
+                    log.error(
+                        "Speaker attribution INCOMPLETE: captured %d audio track(s) "
+                        "for %d attendee(s) (%s). Discarding the speaker timeline "
+                        "so transcription falls back to voice-based diarization "
+                        "instead of trusting a partial one.",
+                        len(track_keys),
+                        expected,
+                        sorted(attendee_ids) if attendee_ids else others,
+                    )
+                    return_events_suppressed = True
+                else:
+                    return_events_suppressed = False
+
                 # Build speaker_events. Any trackKey not in `labels` (e.g. an
                 # event from a track that vanished before extraction) gets a
-                # safe Speaker N label.
-                fallback_counter = 0
+                # safe Speaker N label. Seed the counter past the ones already
+                # handed out so two different tracks can't both be "Speaker 1".
+                fallback_counter = speaker_n
                 for ev in raw_events:
                     tk = ev.get("trackKey")
                     label = labels.get(tk)
@@ -1074,6 +1379,9 @@ class AudioRecorder:
                             "label": label,
                         }
                     )
+
+                if return_events_suppressed:
+                    speaker_events = []
             except Exception:
                 log.exception("Failed to extract speaker timeline")
 
@@ -1101,4 +1409,9 @@ class AudioRecorder:
             with open(output_path, "wb") as f:
                 pass
 
-        return output_path, speaker_events
+        log.info(
+            "Call attendees observed in-call (%d): %s",
+            len(attendee_ids),
+            sorted(attendee_ids),
+        )
+        return output_path, speaker_events, attendee_ids

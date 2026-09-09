@@ -42,9 +42,13 @@ def test_extract_follow_up_email_fallback():
 
 @patch("notetaker.mailer.smtplib.SMTP")
 def test_send_notes_email(mock_smtp_class):
-    mock_smtp = MagicMock()
-    mock_smtp_class.return_value.__enter__ = MagicMock(return_value=mock_smtp)
-    mock_smtp_class.return_value.__exit__ = MagicMock(return_value=False)
+    # Real smtplib.SMTP.__enter__ returns self, so the code under test uses
+    # the connection object itself rather than a separate context value.
+    mock_smtp = mock_smtp_class.return_value
+    mock_smtp.__enter__.return_value = mock_smtp
+    mock_smtp.__exit__.return_value = False
+    mock_smtp.has_extn.return_value = False
+    mock_smtp.send_message.return_value = {}
 
     recipients = [
         {"email": "alice@example.com", "display_name": "Alice"},

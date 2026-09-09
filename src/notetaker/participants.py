@@ -13,21 +13,29 @@ MAX_RETRIES = 3
 RETRY_DELAY = 5
 
 
-def _get_email_from_api(base: str, auth: tuple, uid: str) -> str:
-    """Try to get email via Nextcloud user API (requires admin)."""
+def _get_email_from_api(base: str, auth: tuple, uid: str) -> tuple[str, bool]:
+    """Look up a user's email via the Nextcloud user API (requires admin).
+
+    Returns (email, lookup_ok). ``lookup_ok`` distinguishes "the user
+    genuinely has no email on file" from "the lookup itself failed" —
+    collapsing those two into an empty string is how bogus addresses get
+    silently fabricated.
+    """
     try:
         user_resp = requests.get(
             f"{base}/ocs/v1.php/cloud/users/{uid}",
             auth=auth,
             headers=OCS_HEADERS,
+            timeout=15,
         )
         user_resp.raise_for_status()
         data = user_resp.json()["ocs"]["data"]
         if isinstance(data, dict):
-            return data.get("email", "")
+            return data.get("email", "") or "", True
+        return "", True
     except Exception as exc:
-        log.debug("API email lookup failed for %s: %s", uid, exc)
-    return ""
+        log.warning("API email lookup failed for %s: %s", uid, exc)
+    return "", False
 
 
 def get_participant_emails(
@@ -38,7 +46,18 @@ def get_participant_emails(
     mail_domain: str = "",
     email_overrides: dict[str, str] | None = None,
     exclude_user: str = "",
+    attendee_ids: set[str] | None = None,
 ) -> list[dict[str, str]]:
+    """Resolve room participants to email addresses.
+
+    ``attendee_ids`` — when provided, only these user IDs are returned.
+    The Talk participants endpoint lists every *member of the conversation*,
+    and once a call has ended everyone's ``inCall`` flag is back to 0, so
+    attendance cannot be recovered after the fact. The recorder observes it
+    live during the call and passes it in here. Without this filter, a
+    two-person call inside a twelve-member room emails the notes to ten
+    people who were never on it.
+    """
     base = nextcloud_url.rstrip("/")
     auth = (user, password)
     overrides = email_overrides or {}
@@ -75,13 +94,27 @@ def get_participant_emails(
 
     # Determine fallback domain for email derivation
     fallback_domain = mail_domain or urlparse(nextcloud_url).hostname
+    if not fallback_domain:
+        log.error(
+            "No MAIL_DOMAIN and NEXTCLOUD_URL has no hostname (%s) — cannot derive "
+            "fallback addresses",
+            nextcloud_url,
+        )
 
     result = []
+    skipped_non_attendee = []
+    skipped_guest = 0
     for p in participants:
-        if p["actorType"] != "users":
+        if p.get("actorType") != "users":
+            skipped_guest += 1
             continue
-        uid = p["actorId"]
-        if uid == exclude_user:
+        uid = p.get("actorId")
+        if not uid or uid == exclude_user:
+            continue
+
+        # Only people who were actually on the call, when we know who they were.
+        if attendee_ids is not None and uid not in attendee_ids:
+            skipped_non_attendee.append(uid)
             continue
 
         # Check overrides first, then API, then derive from domain
@@ -89,17 +122,42 @@ def get_participant_emails(
             email = overrides[uid]
             log.info("Using override email for user %s: %s", uid, email)
         else:
-            email = _get_email_from_api(base, auth, uid)
+            email, lookup_ok = _get_email_from_api(base, auth, uid)
             if not email:
+                if not fallback_domain:
+                    log.error("No email for user %s and no fallback domain — skipping", uid)
+                    continue
                 email = f"{uid}@{fallback_domain}"
-                log.info("Using derived email for user %s: %s", uid, email)
+                if lookup_ok:
+                    log.info("Using derived email for user %s: %s", uid, email)
+                else:
+                    # The lookup errored, so this address is a guess that may
+                    # bounce or reach the wrong person. Say so loudly.
+                    log.warning(
+                        "Email lookup FAILED for user %s — guessing %s. Verify this "
+                        "address; set EMAIL_OVERRIDES if it is wrong.",
+                        uid,
+                        email,
+                    )
 
         result.append(
             {
                 "user_id": uid,
-                "display_name": p["displayName"],
+                "display_name": p.get("displayName") or uid,
                 "email": email,
             }
         )
 
+    if skipped_non_attendee:
+        log.info(
+            "Excluded %d room member(s) who were not in the call: %s",
+            len(skipped_non_attendee),
+            skipped_non_attendee,
+        )
+    if skipped_guest:
+        log.warning(
+            "Skipped %d non-user participant(s) (guests/federated) — they have no "
+            "resolvable email and will not receive the notes",
+            skipped_guest,
+        )
     return result

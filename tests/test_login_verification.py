@@ -13,6 +13,61 @@ import pytest
 from notetaker.recorder import AudioRecorder
 
 
+def _evaluate_dispatcher():
+    """Return an evaluate() mock that answers based on the JS it is given.
+
+    A fixed side_effect list breaks whenever the poll loop changes shape
+    (it already did when the 60s grace period was added), which makes these
+    tests fail for reasons unrelated to what they are testing.
+    """
+
+    async def _evaluate(js, *args, **kwargs):
+        src = js if isinstance(js, str) else str(js)
+        if "proxyInstalled" in src:
+            return {
+                "proxyInstalled": True,
+                "rtcType": "function",
+                "rtcAvailable": True,
+                "gumAvailable": True,
+            }
+        if "gumCount" in src:
+            return {
+                "hasRecorder": True,
+                "hasCtx": True,
+                "chunks": 1,
+                "pcCount": 1,
+                "trackCount": 1,
+                "gumCount": 1,
+            }
+        if "ctxState" in src:
+            return {
+                "hasRecorder": True,
+                "chunks": 5,
+                "pcCount": 1,
+                "trackCount": 1,
+                "ctxState": "running",
+            }
+        if "__notetaker_recorder !== null" in src:
+            return True
+        if "__nt_timeline" in src or "trackKeys" in src:
+            return {
+                "timeline": [],
+                "labels": {},
+                "trackKeys": [],
+                "rmsSummary": {},
+                "sigLabels": {},
+                "domLabels": {},
+                "sigMap": {},
+                "wsUrls": [],
+            }
+        if "__notetaker_chunks" in src:
+            return None
+        return None
+
+    return AsyncMock(side_effect=_evaluate)
+
+
+
 def _make_recorder():
     return AudioRecorder(
         nextcloud_url="https://nc.example.com",
@@ -134,45 +189,14 @@ async def test_successful_login_proceeds():
 
     page.locator = enhanced_locator
 
-    # Make _others_in_call return False immediately (call ended)
+    # Make presence report an empty call immediately (call ended)
     with (
         patch("playwright.async_api.async_playwright", return_value=pw_ctx),
-        patch("notetaker.recorder._others_in_call", return_value=False, create=True),
+        patch("notetaker.recorder._call_presence", return_value=(set(), 0), create=True),
     ):
         # Should complete without raising
-        page.evaluate = AsyncMock(
-            side_effect=[
-                # Pre-join diagnostics
-                {
-                    "proxyInstalled": True,
-                    "rtcType": "function",
-                    "rtcAvailable": True,
-                    "gumAvailable": True,
-                },
-                # Audio capture checks (6 iterations)
-                {
-                    "hasRecorder": True,
-                    "hasCtx": True,
-                    "chunks": 1,
-                    "pcCount": 1,
-                    "trackCount": 1,
-                    "gumCount": 1,
-                },
-                # Poll loop diagnostics
-                {
-                    "hasRecorder": True,
-                    "chunks": 5,
-                    "pcCount": 1,
-                    "trackCount": 1,
-                    "ctxState": "running",
-                },
-                # Extract speaker timeline
-                {"timeline": [], "labels": {}, "trackKeys": []},
-                # Extract audio
-                None,
-            ]
-        )
-        audio_path, events = await recorder.record_call("room123", "Test Call")
+        page.evaluate = _evaluate_dispatcher()
+        audio_path, events, attendees = await recorder.record_call("room123", "Test Call")
         assert audio_path.endswith(".webm")
         assert events == []
 
@@ -188,35 +212,9 @@ async def test_login_waits_for_form_elements():
 
     with (
         patch("playwright.async_api.async_playwright", return_value=pw_ctx),
-        patch("notetaker.recorder._others_in_call", return_value=False, create=True),
+        patch("notetaker.recorder._call_presence", return_value=(set(), 0), create=True),
     ):
-        page.evaluate = AsyncMock(
-            side_effect=[
-                {
-                    "proxyInstalled": True,
-                    "rtcType": "function",
-                    "rtcAvailable": True,
-                    "gumAvailable": True,
-                },
-                {
-                    "hasRecorder": True,
-                    "hasCtx": True,
-                    "chunks": 1,
-                    "pcCount": 1,
-                    "trackCount": 1,
-                    "gumCount": 1,
-                },
-                {
-                    "hasRecorder": True,
-                    "chunks": 5,
-                    "pcCount": 1,
-                    "trackCount": 1,
-                    "ctxState": "running",
-                },
-                {"timeline": [], "labels": {}, "trackKeys": []},
-                None,
-            ]
-        )
+        page.evaluate = _evaluate_dispatcher()
         await recorder.record_call("room123", "Test Call")
 
     # Verify wait_for was called on the user field locator

@@ -103,7 +103,7 @@ def test_timeline_contiguous_same_speaker_merges():
 
 
 def test_resolve_all_dom_labeled():
-    labels, known, ord_, sn = resolve_stream_labels(
+    labels, known, ord_, sn, _conf = resolve_stream_labels(
         ["s1", "s2"],
         {"s1": "Alex", "s2": "Brantley"},
         ["Alex", "Brantley"],
@@ -113,7 +113,7 @@ def test_resolve_all_dom_labeled():
 
 
 def test_resolve_unambiguous_ordinal_fills_one():
-    labels, known, ord_, sn = resolve_stream_labels(
+    labels, known, ord_, sn, _conf = resolve_stream_labels(
         ["s1", "s2"],
         {"s1": "Alex", "s2": None},
         ["Alex", "Brantley"],
@@ -124,7 +124,7 @@ def test_resolve_unambiguous_ordinal_fills_one():
 
 def test_resolve_no_dom_two_streams_uses_speaker_n_not_guess():
     """With ≥2 ambiguous unlabeled streams we must NOT guess names — use Speaker N."""
-    labels, known, ord_, sn = resolve_stream_labels(
+    labels, known, ord_, sn, _conf = resolve_stream_labels(
         ["s1", "s2"],
         {"s1": None, "s2": None},
         ["Alex", "Brantley"],
@@ -137,7 +137,7 @@ def test_resolve_dom_collision_prevented():
     """H2 regression: a DOM-labeled name must not be re-used by ordinal fallback."""
     # 3 streams: s1 DOM=Brantley. Two unlabeled. Two remaining names but one
     # is "Brantley" which is already claimed.
-    labels, known, ord_, sn = resolve_stream_labels(
+    labels, known, ord_, sn, _conf = resolve_stream_labels(
         ["s1", "s2", "s3"],
         {"s1": "Brantley", "s2": None, "s3": None},
         ["Alex", "Brantley", "Carla"],
@@ -153,7 +153,7 @@ def test_resolve_dom_collision_prevented():
 
 def test_resolve_unambiguous_with_one_dom_and_one_unlabeled():
     """1 DOM-labeled + 1 unlabeled + 1 remaining name = unambiguous, fill it."""
-    labels, known, ord_, sn = resolve_stream_labels(
+    labels, known, ord_, sn, _conf = resolve_stream_labels(
         ["s1", "s2"],
         {"s1": "Brantley", "s2": None},
         ["Alex", "Brantley"],
@@ -163,7 +163,7 @@ def test_resolve_unambiguous_with_one_dom_and_one_unlabeled():
 
 
 def test_resolve_no_participants_falls_back_to_speaker_n():
-    labels, known, ord_, sn = resolve_stream_labels(["s1"], {"s1": None}, [])
+    labels, known, ord_, sn, _conf = resolve_stream_labels(["s1"], {"s1": None}, [])
     assert labels == {"s1": "Speaker 1"}
     assert (known, ord_, sn) == (0, 0, 1)
 
@@ -171,7 +171,7 @@ def test_resolve_no_participants_falls_back_to_speaker_n():
 def test_resolve_signaling_labels_take_priority():
     """Signaling labels are merged into dom_labels before calling resolve.
     When all tracks have signaling labels, ordinal/Speaker N are not used."""
-    labels, known, ord_, sn = resolve_stream_labels(
+    labels, known, ord_, sn, _conf = resolve_stream_labels(
         ["t1", "t2", "t3"],
         {"t1": "Alice", "t2": "Bob", "t3": "Carla"},
         ["Alice", "Bob", "Carla"],
@@ -182,7 +182,7 @@ def test_resolve_signaling_labels_take_priority():
 
 def test_resolve_mixed_signaling_and_unlabeled():
     """Some tracks have signaling labels, some don't. Unlabeled uses ordinal if unambiguous."""
-    labels, known, ord_, sn = resolve_stream_labels(
+    labels, known, ord_, sn, _conf = resolve_stream_labels(
         ["t1", "t2", "t3"],
         {"t1": "Alice", "t2": "Bob", "t3": None},
         ["Alice", "Bob", "Carla"],
