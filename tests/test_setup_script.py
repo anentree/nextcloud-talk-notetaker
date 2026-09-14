@@ -25,8 +25,8 @@ case "$1 $2" in
   "--version ")       echo "Docker version 27.0.0-stub"; exit 0 ;;
   "compose version")  exit 0 ;;
   "compose up")       echo "compose up $*" >> "$STUB_CALLS"; exit 0 ;;
-  "compose ps")       echo "stubcontainer123"; exit 0 ;;
-  "compose logs")     printf '%s\n' "$STUB_LOGS"; exit 0 ;;
+  "compose ps")       [ "${STUB_PS_EXIT:-0}" = 0 ] && echo "stubcontainer123"; exit "${STUB_PS_EXIT:-0}" ;;
+  "compose logs")     printf '%s\n' "$STUB_LOGS"; exit "${STUB_LOGS_EXIT:-0}" ;;
   "inspect --format") echo "$STUB_HEALTH"; exit 0 ;;
 esac
 echo "stub docker: unhandled args: $*" >&2
@@ -270,6 +270,30 @@ def test_health_wait_times_out_loudly(tmp_path):
     result = run_setup(tmp_path, answers(), health="running starting", logs="still starting")
     assert result.returncode == 1
     assert "did not become healthy" in result.stdout
+
+
+def test_compose_ps_failure_is_reported_not_a_raw_bash_error(tmp_path):
+    """`CONTAINER_ID=$($COMPOSE_CMD ps -q notetaker | head -n1)` is not safe
+    under `set -euo pipefail`: if `ps` exits non-zero while `head` still exits
+    0, pipefail fails the pipeline and set -e aborts the script right there,
+    before the friendly -z check ever runs. Repro: `set -euo pipefail;
+    f() { return 3; }; x=$(f | head -n1); echo reached` never prints
+    "reached". The wizard must show its own error, not die with a raw one."""
+    result = run_setup(tmp_path, answers(), env_overrides={"STUB_PS_EXIT": "3"})
+    assert result.returncode == 1
+    assert "The notetaker container was not created" in result.stdout
+
+
+def test_compose_logs_failure_still_shows_the_fix_hint(tmp_path):
+    """Same pipefail class of bug inside show_startup_log: if `compose logs`
+    exits non-zero, `set -e` must not abort the function before its trailing
+    `info "Fix the setting..."` hint prints."""
+    result = run_setup(
+        tmp_path, answers(), health="restarting unhealthy", logs=PREFLIGHT_FAIL_LOG,
+        env_overrides={"STUB_LOGS_EXIT": "1"},
+    )
+    assert result.returncode == 1
+    assert "Fix the setting it names in .env" in result.stdout
 
 
 def test_setup_script_parses_and_lints():

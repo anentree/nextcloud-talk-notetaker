@@ -471,7 +471,8 @@ $COMPOSE_CMD up -d --build
 HEALTH_POLL_INTERVAL="${SETUP_HEALTH_POLL_INTERVAL:-5}"
 HEALTH_TIMEOUT="${SETUP_HEALTH_TIMEOUT:-180}"
 info "Waiting for the notetaker to pass its startup checks (up to ${HEALTH_TIMEOUT}s)..."
-CONTAINER_ID=$($COMPOSE_CMD ps -q notetaker 2>/dev/null | head -n1)
+CONTAINER_ID=$($COMPOSE_CMD ps -q notetaker 2>/dev/null || true)
+CONTAINER_ID=${CONTAINER_ID%%$'\n'*}
 if [ -z "$CONTAINER_ID" ]; then
     error "The notetaker container was not created. Output of '$COMPOSE_CMD up' is above."
     exit 1
@@ -487,7 +488,7 @@ show_startup_log() {
             *PREFLIGHT*|*"Refusing to start"*) printf "${RED}%s${NC}\n" "$line" ;;
             *)                                 printf "%s\n" "$line" ;;
         esac
-    done
+    done || true
     echo
     info "Fix the setting it names in .env and run: $COMPOSE_CMD up -d"
 }
