@@ -32,6 +32,8 @@ The setup wizard will guide you through:
 4. Choosing where to save notes
 5. Optionally configuring email notifications
 
+Re-running `./setup.sh` keeps a copy of your previous settings as `.env.bak.<timestamp>`.
+
 ## Prerequisites
 
 - **Linux** with Docker (Ubuntu, Debian, Fedora, Arch, or any distro)
@@ -72,28 +74,35 @@ Notes are saved as `YYYY-MM-DD-HHMM-firstname-firstname.md`, with participant fi
 
 All configuration is via environment variables in `.env`:
 
-| Variable                 | Required | Default                 | Description                                            |
-| ------------------------ | -------- | ----------------------- | ------------------------------------------------------ |
-| `NEXTCLOUD_URL`          | Yes      | —                       | Nextcloud base URL (e.g., `https://cloud.example.com`) |
-| `NEXTCLOUD_USER`         | Yes      | —                       | Bot username                                           |
-| `NEXTCLOUD_PASSWORD`     | Yes      | —                       | Bot password (or app password)                         |
-| `NEXTCLOUD_WEB_PASSWORD` | No       | same as PASSWORD        | Separate browser login password (Yunohost SSO)         |
-| `GEMINI_API_KEY`         | Yes      | —                       | Google Gemini API key                                  |
-| `AUTH_METHOD`            | No       | `nextcloud`             | `nextcloud` (standard login) or `yunohost` (SSO)       |
-| `GEMINI_MODEL`           | No       | `gemini-2.5-flash-lite` | Gemini model for transcription                         |
-| `NOTES_STORAGE`          | No       | `nextcloud`             | `nextcloud` (WebDAV) or `local` (filesystem)           |
-| `NOTES_FOLDER`           | No       | `/Talk/Notes`           | Nextcloud folder for notes                             |
-| `LOCAL_NOTES_DIR`        | No       | —                       | Local directory for notes (when storage=local)         |
-| `FILENAME_LAST_USER`     | No       | —                       | User ID always placed last in filenames                |
-| `POLL_INTERVAL_SECONDS`  | No       | `10`                    | Seconds between poll cycles                            |
-| `AUDIO_DIR`              | No       | `/tmp/notetaker-audio`  | Temp directory for audio files                         |
-| `SMTP_HOST`              | No       | `localhost`             | SMTP server                                            |
-| `SMTP_PORT`              | No       | `25`                    | SMTP port                                              |
-| `SMTP_FROM`              | No       | —                       | Sender email address                                   |
-| `SMTP_USER`              | No       | —                       | SMTP username                                          |
-| `SMTP_PASSWORD`          | No       | —                       | SMTP password                                          |
-| `EMAIL_OVERRIDES`        | No       | —                       | Comma-separated `user=email` overrides                 |
-| `MAIL_DOMAIN`            | No       | —                       | Fallback domain for email addresses                    |
+| Variable                      | Required | Default                    | Description                                                                    |
+| ----------------------------- | -------- | -------------------------- | ------------------------------------------------------------------------------ |
+| `NEXTCLOUD_URL`               | Yes      | —                          | Nextcloud base URL (e.g., `https://cloud.example.com`)                         |
+| `NEXTCLOUD_USER`              | Yes      | —                          | Bot username                                                                   |
+| `NEXTCLOUD_PASSWORD`          | Yes      | —                          | Bot password (or app password)                                                 |
+| `NEXTCLOUD_WEB_PASSWORD`      | No       | same as PASSWORD           | Separate browser login password (Yunohost SSO)                                 |
+| `GEMINI_API_KEY`              | Yes      | —                          | Google Gemini API key                                                          |
+| `AUTH_METHOD`                 | No       | `nextcloud`                | `nextcloud` (standard login) or `yunohost` (SSO)                               |
+| `GEMINI_MODEL`                | No       | `gemini-2.5-flash-lite`    | Gemini model for transcription                                                 |
+| `NOTES_STORAGE`               | No       | `nextcloud`                | `nextcloud` (WebDAV) or `local` (filesystem)                                   |
+| `NOTES_FOLDER`                | No       | `/Talk/Notes`              | Nextcloud folder for notes (the wizard sets `/meeting-notes`)                  |
+| `LOCAL_NOTES_DIR`             | No       | —                          | Local directory for notes (when storage=local)                                 |
+| `FILENAME_LAST_USER`          | No       | —                          | User ID always placed last in filenames                                        |
+| `POLL_INTERVAL_SECONDS`       | No       | `10`                       | Seconds between poll cycles                                                    |
+| `AUDIO_DIR`                   | No       | `/tmp/notetaker-audio`     | Temp directory for audio files                                                 |
+| `SMTP_HOST`                   | No       | `localhost`                | SMTP server                                                                    |
+| `SMTP_PORT`                   | No       | `25`                       | SMTP port                                                                      |
+| `SMTP_FROM`                   | No       | —                          | Sender email address                                                           |
+| `SMTP_USER`                   | No       | —                          | SMTP username                                                                  |
+| `SMTP_PASSWORD`               | No       | —                          | SMTP password                                                                  |
+| `EMAIL_OVERRIDES`             | No       | —                          | Comma-separated `user=email` overrides                                         |
+| `MAIL_DOMAIN`                 | No       | —                          | Fallback domain for email addresses                                            |
+| `SMTP_TLS_VERIFY`             | No       | `auto`                     | `auto` verifies real hosts and skips only local hops; `true`/`false` force it  |
+| `SMTP_TIMEOUT_SECONDS`        | No       | `30`                       | Connect/read timeout for SMTP                                                  |
+| `STATE_DIR`                   | No       | `/data/notes`              | Persistent dir for the email spool and retained recordings (not a tmpfs)       |
+| `HEARTBEAT_FILE`              | No       | `/tmp/notetaker-heartbeat` | Touched every poll; the container healthcheck reads its age                    |
+| `RETAINED_AUDIO_MAX_AGE_DAYS` | No       | `30`                       | Days to keep a recording whose notes could not be produced                     |
+| `NOTETAKER_VAD_THRESHOLD`     | No       | `0.02`                     | RMS level above which a track counts as speech for speaker attribution         |
+| `SKIP_PREFLIGHT`              | No       | —                          | Set to `1` to start even if a startup dependency check fails (not recommended) |
 
 ## Notes Output
 
@@ -126,6 +135,10 @@ Each call produces a markdown file with:
 **"404 Not Found" on Talk API**: The Nextcloud Talk app may not be installed.
 
 **No email notifications**: The bot needs subadmin status for user groups to look up email addresses. See setup instructions above.
+
+**Container keeps restarting / setup says startup checks failed**: The notetaker checks Nextcloud, the notes folder, Gemini, SMTP and its state directory at startup and refuses to run if one fails. `docker compose logs notetaker | grep PREFLIGHT` names the one that failed; fix that value in `.env` and run `docker compose up -d`.
+
+**Mail server on the same machine**: use `SMTP_HOST=host.docker.internal`, not `localhost` — inside the container `localhost` is the container.
 
 **Transcription quality**: Gemini may mishear proper nouns. This is inherent to speech-to-text. For important terms, check the notes after generation.
 

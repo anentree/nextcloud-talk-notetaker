@@ -302,3 +302,22 @@ def test_setup_script_parses_and_lints():
         subprocess.run(["shellcheck", "-S", "warning", str(REPO / "setup.sh")], check=True)
     else:
         pytest.skip("shellcheck not installed")
+
+
+def _code_env_names() -> set[str]:
+    names = set()
+    for py in (REPO / "src" / "notetaker").glob("*.py"):
+        names |= set(re.findall(
+            r'os\.(?:getenv|environ\.get|environ)\s*[\(\[]\s*"([A-Z][A-Z0-9_]+)"',
+            py.read_text(),
+        ))
+    return names
+
+
+def test_env_example_and_readme_document_every_setting_the_code_reads():
+    code = _code_env_names()
+    assert code, "no env reads found - regex broken?"
+    readme = set(re.findall(r"^\| `([A-Z][A-Z0-9_]+)`", (REPO / "README.md").read_text(), re.M))
+    assert not code - env_example_keys(), f".env.example missing: {sorted(code - env_example_keys())}"
+    assert not code - readme, f"README table missing: {sorted(code - readme)}"
+    assert not env_example_keys() - code, f".env.example documents unknown settings: {sorted(env_example_keys() - code)}"
