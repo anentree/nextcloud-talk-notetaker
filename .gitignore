@@ -13,3 +13,12 @@ notes/
 .ruff_cache/
 .pytest_cache/
 docs/superpowers/
+
+# Vendored copy of https://get.docker.com, kept locally for offline installs
+install-docker.sh
+# uv-managed dev environment; the container uses pip + pyproject.toml
+uv.lock
+requirements-captured.txt
+
+# Scratch workspace for in-flight SDD tasks; never committed
+.superpowers/

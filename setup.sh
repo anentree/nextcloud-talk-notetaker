@@ -266,9 +266,13 @@ LOCAL_NOTES_DIR=""
 
 if [ "$STORAGE_CHOICE" = "B" ]; then
     NOTES_STORAGE="local"
-    LOCAL_NOTES_DIR=$(prompt_value "Path for local notes" "./notes")
-    mkdir -p "$LOCAL_NOTES_DIR"
-    success "Local notes directory: $LOCAL_NOTES_DIR"
+    # This path is INSIDE the container. docker-compose.yml mounts ./notes
+    # (next to this script) at /data/notes; nothing else persists across a
+    # restart. Before 2026-09-14 the wizard wrote a host path here and the
+    # notes silently went to /app/notes inside the container.
+    LOCAL_NOTES_DIR="/data/notes"
+    mkdir -p ./notes
+    success "Notes will be written to ./notes (mounted as $LOCAL_NOTES_DIR in the container)"
 else
     echo
     echo "The bot saves notes to a folder in its own Nextcloud file space."
@@ -319,8 +323,16 @@ EMAIL_OVERRIDES=""
 
 if prompt_yn "Send email notifications after each call?"; then
     echo
-    SMTP_HOST=$(prompt_value "SMTP host" "localhost")
-    SMTP_PORT=$(prompt_value "SMTP port" "25")
+    echo "The notetaker runs in a container, so 'localhost' would be the container"
+    echo "itself. A mail server on this machine is reached as host.docker.internal."
+    SMTP_HOST=$(prompt_value "SMTP host" "host.docker.internal")
+    case "$SMTP_HOST" in
+        localhost|127.0.0.1|::1)
+            warn "Rewriting SMTP host '$SMTP_HOST' to host.docker.internal (the container's name for this machine)"
+            SMTP_HOST="host.docker.internal"
+            ;;
+    esac
+    SMTP_PORT=$(prompt_value "SMTP port" "587")
     SMTP_FROM=$(prompt_value "From address (e.g., notetaker@example.com)")
     if prompt_yn "Does the SMTP server require authentication?"; then
         SMTP_USER=$(prompt_value "SMTP username")
