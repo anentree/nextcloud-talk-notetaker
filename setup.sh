@@ -465,6 +465,56 @@ info "Building and starting the notetaker..."
 echo
 $COMPOSE_CMD up -d --build
 
+# The app checks every dependency at startup and refuses to run if one
+# fails; the container then restarts in a loop. Wait for the healthcheck
+# instead of assuming success.
+HEALTH_POLL_INTERVAL="${SETUP_HEALTH_POLL_INTERVAL:-5}"
+HEALTH_TIMEOUT="${SETUP_HEALTH_TIMEOUT:-180}"
+info "Waiting for the notetaker to pass its startup checks (up to ${HEALTH_TIMEOUT}s)..."
+CONTAINER_ID=$($COMPOSE_CMD ps -q notetaker 2>/dev/null | head -n1)
+if [ -z "$CONTAINER_ID" ]; then
+    error "The notetaker container was not created. Output of '$COMPOSE_CMD up' is above."
+    exit 1
+fi
+
+show_startup_log() {
+    echo
+    error "Startup checks did not pass. Last lines of the container log:"
+    echo
+    # PREFLIGHT lines name the dependency that failed; make them stand out.
+    $COMPOSE_CMD logs --tail 40 notetaker 2>&1 | while IFS= read -r line; do
+        case "$line" in
+            *PREFLIGHT*|*"Refusing to start"*) printf "${RED}%s${NC}\n" "$line" ;;
+            *)                                 printf "%s\n" "$line" ;;
+        esac
+    done
+    echo
+    info "Fix the setting it names in .env and run: $COMPOSE_CMD up -d"
+}
+
+WAITED=0
+STATE=""
+while [ "$WAITED" -le "$HEALTH_TIMEOUT" ]; do
+    STATE=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_ID" 2>/dev/null || echo "missing none")
+    case "$STATE" in
+        "running healthy")
+            break ;;
+        "restarting "*|"exited "*|"dead "*|"missing "*|*" unhealthy")
+            show_startup_log
+            exit 1 ;;
+    esac
+    sleep "$HEALTH_POLL_INTERVAL"
+    WAITED=$((WAITED + HEALTH_POLL_INTERVAL))
+    # A zero interval (tests) must still advance the clock.
+    [ "$HEALTH_POLL_INTERVAL" -eq 0 ] && WAITED=$((WAITED + 1))
+done
+
+if [ "$STATE" != "running healthy" ]; then
+    error "The notetaker did not become healthy within ${HEALTH_TIMEOUT}s (last state: $STATE)."
+    show_startup_log
+    exit 1
+fi
+
 echo
 success "Notetaker is running!"
 echo

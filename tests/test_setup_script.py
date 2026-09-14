@@ -241,3 +241,40 @@ def test_empty_web_password_is_left_unset_so_the_app_falls_back(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "NEXTCLOUD_WEB_PASSWORD" not in read_env(tmp_path)
     assert "# NEXTCLOUD_WEB_PASSWORD=" in (tmp_path / "work" / ".env").read_text()
+
+
+PREFLIGHT_FAIL_LOG = (
+    "2026-09-14 18:03:20 notetaker.preflight INFO PREFLIGHT ok: state-dir\n"
+    "2026-09-14 18:03:21 notetaker.preflight ERROR PREFLIGHT FAILED: smtp: [Errno 111] Connection refused\n"
+    "2026-09-14 18:03:21 notetaker.main ERROR Refusing to start with 1 failed preflight check(s). Set SKIP_PREFLIGHT=1 to override.\n"
+)
+
+
+def test_unhealthy_container_is_reported_not_celebrated(tmp_path):
+    """The app refuses to start when a dependency check fails and the
+    container crash-loops. The wizard must say so and show the reason."""
+    result = run_setup(tmp_path, answers(), health="restarting unhealthy", logs=PREFLIGHT_FAIL_LOG)
+    assert result.returncode == 1
+    assert "PREFLIGHT FAILED: smtp" in result.stdout
+    assert "Notetaker is running" not in result.stdout
+
+
+def test_healthy_container_is_reported_running(tmp_path):
+    result = run_setup(tmp_path, answers(), health="running healthy")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Notetaker is running" in result.stdout
+
+
+def test_health_wait_times_out_loudly(tmp_path):
+    """A container that never becomes healthy (stuck 'starting') is a failure too."""
+    result = run_setup(tmp_path, answers(), health="running starting", logs="still starting")
+    assert result.returncode == 1
+    assert "did not become healthy" in result.stdout
+
+
+def test_setup_script_parses_and_lints():
+    subprocess.run(["bash", "-n", str(REPO / "setup.sh")], check=True)
+    if shutil.which("shellcheck"):
+        subprocess.run(["shellcheck", "-S", "warning", str(REPO / "setup.sh")], check=True)
+    else:
+        pytest.skip("shellcheck not installed")
