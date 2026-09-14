@@ -4,13 +4,12 @@ import asyncio
 import logging
 import os
 import re
-import shutil
 import signal
 import sys
 import time
 from datetime import datetime
 
-from notetaker import spool
+from notetaker import retained, spool
 from notetaker.config import Config
 from notetaker.mailer import extract_follow_up_email, send_notes_email
 from notetaker.monitor import CallMonitor
@@ -173,45 +172,36 @@ async def handle_call(cfg: Config, room: dict) -> None:
     audio_path, speaker_events, attendee_ids = await recorder.record_call(token, name)
     log.info("Captured %d speaker events for room '%s'", len(speaker_events), name)
 
+    # Everything the rest of the pipeline needs, in one place, so that if it
+    # fails the recording can be retained WITH this context and finished
+    # later by drain_retained(). Before 2026-09-14 only the audio survived a
+    # failure; the recipients and speaker timeline were computed and lost.
+    meta = {
+        "token": token,
+        "name": name,
+        "call_start": call_start.isoformat(),
+        "speaker_events": speaker_events,
+        "attendee_ids": sorted(attendee_ids),
+        "participants": None,
+    }
+
     # Everything from here on must leave the recording in a defined state:
     # deleted if the notes are safe, moved somewhere persistent if not. An
     # exception escaping in between (a Gemini outage, a bad display name)
     # would otherwise strand the file in tmpfs until the next restart.
     notes_saved = False
     try:
-        notes_saved = await _process_recording(
-            cfg, token, name, call_start, audio_path, speaker_events, attendee_ids
-        )
+        notes_saved = await _process_recording(cfg, meta, audio_path)
     finally:
         if notes_saved:
             _discard_audio(audio_path)
         elif os.path.exists(audio_path):
-            _retain_audio(cfg, audio_path, token)
+            _retain_audio(cfg, audio_path, meta)
 
 
-async def _process_recording(
-    cfg: Config,
-    token: str,
-    name: str,
-    call_start: datetime,
-    audio_path: str,
-    speaker_events: list,
-    attendee_ids: set,
-) -> bool:
-    """Transcribe, store and email one recording. Returns True if the notes
-    reached durable storage (which is what decides whether the audio can be
-    thrown away)."""
-    # 2. Check audio is not empty
-    audio_size = os.path.getsize(audio_path)
-    if audio_size == 0:
-        log.warning("Empty audio file for room '%s' — skipping transcription", name)
-        # Nothing to preserve: an empty file is not evidence of anything.
-        return True
-    log.info("Audio file: %s (%d KB)", audio_path, audio_size // 1024)
-
-    # 3. Get participants (needed for filename and email)
-    # Only people actually observed in the call. A room can have members who
-    # never joined; they must not receive the notes.
+def _resolve_participants(cfg: Config, token: str, attendee_ids: set) -> list[dict]:
+    """Recipients for a room: only people actually observed in the call. A
+    room can have members who never joined; they must not receive the notes."""
     if not attendee_ids:
         log.warning(
             "No in-call attendees were observed for room %s — falling back to "
@@ -233,6 +223,40 @@ async def _process_recording(
         token,
         [(p["user_id"], p["email"]) for p in participants],
     )
+    return participants
+
+
+async def _process_recording(cfg: Config, meta: dict, audio_path: str) -> bool:
+    """Transcribe, store and email one recording. Returns True if the notes
+    reached durable storage (which is what decides whether the audio can be
+    thrown away). Fills ``meta["participants"]`` as soon as they are known so
+    a later failure retains them with the audio."""
+    token, name = meta["token"], meta["name"]
+    # 2. Check audio is not empty
+    audio_size = os.path.getsize(audio_path)
+    if audio_size == 0:
+        log.warning("Empty audio file for room '%s' — skipping transcription", name)
+        # Nothing to preserve: an empty file is not evidence of anything.
+        return True
+    log.info("Audio file: %s (%d KB)", audio_path, audio_size // 1024)
+
+    # 3. Get participants (needed for filename and email)
+    participants = _resolve_participants(
+        cfg, token, set(meta.get("attendee_ids") or ())
+    )
+    meta["participants"] = participants
+
+    return _finish_recording(cfg, meta, audio_path, participants)
+
+
+def _finish_recording(
+    cfg: Config, meta: dict, audio_path: str, participants: list[dict]
+) -> bool:
+    """Steps 4-6 of the pipeline, shared by the live call and the retained
+    retry: transcribe, save, email. Returns True once the notes are durable."""
+    token, name = meta["token"], meta["name"]
+    call_start = datetime.fromisoformat(meta["call_start"])
+    speaker_events = meta.get("speaker_events") or []
 
     # 4. Transcribe + summarize
     # Chunked transcription of a long call takes many minutes; keep the
@@ -317,28 +341,49 @@ def _discard_audio(audio_path: str) -> None:
         log.warning("Failed to clean up audio file: %s", audio_path)
 
 
-def _retain_audio(cfg: Config, audio_path: str, token: str) -> None:
-    """Move the recording somewhere persistent so the call can be reprocessed.
+def _retain_audio(cfg: Config, audio_path: str, meta: dict) -> None:
+    """Move the recording somewhere persistent, with its context, so
+    drain_retained() can finish the call later without anyone's help.
 
     AUDIO_DIR is a tmpfs mount, so leaving the file in place would lose it on
     the next container restart.
     """
+    token = meta.get("token", "unknown")
     try:
-        os.makedirs(cfg.retained_audio_dir, exist_ok=True)
-        dest = os.path.join(
-            cfg.retained_audio_dir, f"{token}-{os.path.basename(audio_path)}"
-        )
-        shutil.move(audio_path, dest)
+        dest = retained.retain(cfg.retained_audio_dir, audio_path, meta)
         log.error(
-            "Notes could not be saved for room %s — recording retained at %s "
-            "for manual reprocessing",
+            "Notes could not be saved for room %s — recording retained at %s; "
+            "it will be retried automatically (first try in %d min)",
             token,
             dest,
+            retained.INITIAL_BACKOFF_SECONDS // 60,
         )
     except Exception:
         log.exception(
             "Failed to retain audio for room %s; leaving it at %s", token, audio_path
         )
+
+
+def _retry_recording(cfg: Config, meta: dict, audio_path: str) -> bool:
+    """Finish a retained recording. Recipients were normally resolved during
+    the live call; if that step itself failed (Nextcloud down), do it now."""
+    participants = meta.get("participants")
+    if participants is None:
+        participants = _resolve_participants(
+            cfg, meta["token"], set(meta.get("attendee_ids") or ())
+        )
+    return _finish_recording(cfg, meta, audio_path, participants)
+
+
+def drain_retained(cfg: Config) -> None:
+    """Retry one retained recording that is due. Called every idle poll cycle."""
+    try:
+        retained.drain(
+            cfg.retained_audio_dir,
+            lambda meta, audio: _retry_recording(cfg, meta, audio),
+        )
+    except Exception:
+        log.exception("Error draining retained recordings")
 
 
 def prune_retained_audio(cfg: Config) -> int:
@@ -467,6 +512,12 @@ def main() -> None:
                     # Clear from active set so if the call is still ongoing
                     # (e.g. we left early), it gets re-detected next poll
                     monitor.clear_token(room["token"])
+
+            # Only when nothing live is waiting: a retry transcribes a whole
+            # meeting on this thread, and a call that starts meanwhile would
+            # be joined late. New calls always come first.
+            if not new_calls:
+                drain_retained(cfg)
         except Exception:
             log.exception("Error in poll cycle")
 

@@ -36,7 +36,12 @@ def test_gemini_call_never_returns_none():
     client = MagicMock()
     client.models.generate_content.return_value = _response(None, "MAX_TOKENS")
 
-    with pytest.raises(Exception) as exc_info:
+    # The empty response is treated as transient, so this walks the whole
+    # retry budget - which is minutes long since 2026-09-14. Never sleep it.
+    with (
+        patch("notetaker.transcriber.time.sleep"),
+        pytest.raises(Exception) as exc_info,
+    ):
         _gemini_call(client, ["prompt"])
 
     # It must fail loudly rather than return None, and say why.

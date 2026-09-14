@@ -13,8 +13,17 @@ from google.genai import types
 
 log = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
+# Retry budget for one Gemini call. On 2026-09-08 the API answered 503 "high
+# demand" on and off for about two and a half minutes; three attempts 5s and
+# 10s apart is a 15-second window and lost the meeting. Eight attempts with
+# doubling, capped delays wait 5+10+20+40+80+120+120 = 395s, which is longer
+# than any spike seen so far. Anything longer is handled by retained.py.
+MAX_RETRIES = 8
 RETRY_BASE_DELAY = 5  # seconds
+RETRY_MAX_DELAY = 120  # seconds
+# The container healthcheck declares the process dead after roughly 170s
+# without a heartbeat, so a long backoff sleep must be sliced with beats.
+HEARTBEAT_SLICE = 30  # seconds
 CHUNK_DURATION = 900  # 15 minutes per chunk
 MIN_CHARS_PER_MINUTE = 100  # quality gate: minimum transcript density
 FALLBACK_MODEL = "gemini-2.5-flash"  # stronger model for retries
@@ -337,11 +346,26 @@ def _finish_reason(response) -> str:
         return "UNKNOWN"
 
 
+def _sleep_with_heartbeat(delay: float, heartbeat_fn=None) -> None:
+    """Sleep ``delay`` seconds in slices, proving liveness between them."""
+    remaining = delay
+    while remaining > 0:
+        step = min(remaining, HEARTBEAT_SLICE)
+        time.sleep(step)
+        remaining -= step
+        if heartbeat_fn is not None:
+            try:
+                heartbeat_fn()
+            except Exception:
+                log.debug("Heartbeat callback failed", exc_info=True)
+
+
 def _gemini_call(
     client: genai.Client,
     contents: list,
     max_output_tokens: int = 8192,
     model: str = "gemini-2.5-flash-lite",
+    heartbeat_fn=None,
 ) -> str:
     """Make a Gemini API call with retry logic for all transient errors."""
     for attempt in range(1, MAX_RETRIES + 1):
@@ -377,7 +401,7 @@ def _gemini_call(
                 ]
             )
             if is_transient and attempt < MAX_RETRIES:
-                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
                 log.warning(
                     "Gemini error (attempt %d/%d): %s. Retrying in %ds...",
                     attempt,
@@ -385,7 +409,7 @@ def _gemini_call(
                     exc,
                     delay,
                 )
-                time.sleep(delay)
+                _sleep_with_heartbeat(delay, heartbeat_fn)
             else:
                 raise
 
@@ -402,6 +426,7 @@ def _transcribe_chunk(
     model: str = "gemini-2.5-flash-lite",
     speaker_events: list[dict] | None = None,
     participant_names: list[str] | None = None,
+    heartbeat_fn=None,
 ) -> str:
     """Transcribe a single audio chunk."""
     with open(chunk_path, "rb") as f:
@@ -438,6 +463,7 @@ def _transcribe_chunk(
         ],
         max_output_tokens=SEGMENT_MAX_OUTPUT_TOKENS,
         model=model,
+        heartbeat_fn=heartbeat_fn,
     )
 
     log.info("Segment %d/%d: %d chars", seg_num, total_segs, len(text))
@@ -520,6 +546,7 @@ def transcribe_and_summarize(
             model=model,
             speaker_events=speaker_events,
             participant_names=participant_names,
+            heartbeat_fn=heartbeat_fn,
         )
 
     # Long recordings: chunked pipeline
@@ -558,6 +585,7 @@ def transcribe_and_summarize(
                     model=model,
                     speaker_events=speaker_events,
                     participant_names=participant_names,
+                    heartbeat_fn=heartbeat_fn,
                 )
 
                 # Quality gate: check transcript density (chars per minute)
@@ -587,6 +615,7 @@ def transcribe_and_summarize(
                         model=model,
                         speaker_events=speaker_events,
                         participant_names=participant_names,
+                        heartbeat_fn=heartbeat_fn,
                     )
                     chars_per_min = len(text) / max(chunk_duration_min, 0.1)
 
@@ -616,6 +645,7 @@ def transcribe_and_summarize(
                             model=FALLBACK_MODEL,
                             speaker_events=speaker_events,
                             participant_names=participant_names,
+                            heartbeat_fn=heartbeat_fn,
                         )
                         chars_per_min = len(text) / max(chunk_duration_min, 0.1)
                         if (
@@ -667,7 +697,11 @@ def transcribe_and_summarize(
         )
 
         notes = _gemini_call(
-            client, [synthesis_prompt], max_output_tokens=16384, model=model
+            client,
+            [synthesis_prompt],
+            max_output_tokens=16384,
+            model=model,
+            heartbeat_fn=heartbeat_fn,
         )
         log.info("Final notes: %d chars", len(notes))
         return _prepend_coverage_warning(notes, failed_segments, len(chunks))
@@ -694,6 +728,7 @@ def _single_pass_transcribe(
     model: str = "gemini-2.5-flash-lite",
     speaker_events: list[dict] | None = None,
     participant_names: list[str] | None = None,
+    heartbeat_fn=None,
 ) -> str:
     """Single-pass transcription for short recordings. Converts to MP3 first."""
     # Convert to MP3 for reliability (webm format causes issues with Gemini)
@@ -737,6 +772,7 @@ def _single_pass_transcribe(
             ],
             max_output_tokens=16384,
             model=model,
+            heartbeat_fn=heartbeat_fn,
         )
         log.info("Single-pass transcription: %d chars", len(text))
         return text

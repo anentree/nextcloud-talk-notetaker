@@ -113,6 +113,7 @@ Each call produces a markdown file with:
 - **Transcription**: Chunked pipeline — long recordings (>10 min) are split into 15-minute MP3 segments, each transcribed separately, then synthesized into final notes.
 - **Muting**: The bot uses synthetic silent audio/black video streams so other participants don't hear Chrome's fake device beep.
 - **Gemini cost**: ~$0.02 per 30-minute call on Flash Lite. Free tier (1000 req/day) is sufficient for most teams.
+- **Failure recovery**: Every Gemini call retries transient errors (503 "high demand", 429, timeouts) for about six and a half minutes with backoff. If the notes still cannot be made, the recording is moved to `<state dir>/retained-audio/` together with a `.json` sidecar holding the recipients, speaker timeline and call time, and the poll loop retries it on its own — 15 minutes later, then doubling up to every 6 hours — until the notes are stored and emailed. Recordings are pruned after `RETAINED_AUDIO_MAX_AGE_DAYS` (30). A retained `.webm` with no sidecar predates this and needs `python -m notetaker.reprocess` by hand. Emails that cannot be sent are spooled and retried the same way.
 
 ## Troubleshooting
 
