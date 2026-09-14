@@ -132,6 +132,14 @@ else
     exit 1
 fi
 
+# Every connectivity test below is a curl call.
+if command -v curl >/dev/null 2>&1; then
+    success "curl is available"
+else
+    error "curl is not installed. Install it (apt install curl / dnf install curl) and re-run."
+    exit 1
+fi
+
 # ─── Step 2: Nextcloud Connection ─────────────────────────────────────────────
 header "Step 2: Nextcloud Connection"
 
@@ -358,52 +366,100 @@ fi
 # ─── Step 6: Generate .env and start ─────────────────────────────────────────
 header "Step 6: Starting the Notetaker"
 
-info "Writing .env file..."
+if [ -f .env ]; then
+    ENV_BACKUP=".env.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -p .env "$ENV_BACKUP"
+    chmod 600 "$ENV_BACKUP"
+    warn "Existing .env saved as $ENV_BACKUP"
+fi
 
+# Declined email: document the keys but leave them unset so the app keeps
+# its defaults (python-dotenv would otherwise set them to empty strings).
+if [ -n "$SMTP_HOST" ]; then
+    SMTP_PREFIX=""
+else
+    SMTP_PREFIX="# "
+fi
+
+# Empty web password: leave it unset so config.py falls back to
+# NEXTCLOUD_PASSWORD instead of using an empty string verbatim.
+if [ -n "$NC_WEB_PASS" ]; then
+    WEB_PASS_PREFIX=""
+else
+    WEB_PASS_PREFIX="# "
+fi
+
+info "Writing .env file..."
+umask 077
 cat > .env << ENVFILE
 # Nextcloud connection
 NEXTCLOUD_URL=$NC_URL
 NEXTCLOUD_USER=$NC_USER
 NEXTCLOUD_PASSWORD=$NC_PASS
-ENVFILE
-
-if [ -n "$NC_WEB_PASS" ]; then
-    echo "NEXTCLOUD_WEB_PASSWORD=$NC_WEB_PASS" >> .env
-fi
-
-cat >> .env << ENVFILE
+# Browser login password (only needed for Yunohost SSO, defaults to NEXTCLOUD_PASSWORD)
+${WEB_PASS_PREFIX}NEXTCLOUD_WEB_PASSWORD=$NC_WEB_PASS
 
 # Authentication method: "nextcloud" (standard) or "yunohost" (SSO)
 AUTH_METHOD=$AUTH_METHOD
 
 # Gemini AI
 GEMINI_API_KEY=$GEMINI_KEY
+# Model for transcription (default: gemini-2.5-flash-lite, cheapest option)
 GEMINI_MODEL=gemini-2.5-flash-lite
 
-# Notes storage: "nextcloud" or "local"
+# Notes storage: "nextcloud" (upload via WebDAV) or "local" (save to filesystem)
 NOTES_STORAGE=$NOTES_STORAGE
+# Nextcloud folder path for notes (used when NOTES_STORAGE=nextcloud)
 NOTES_FOLDER=$NOTES_FOLDER
+# Directory INSIDE the container for notes (used when NOTES_STORAGE=local).
+# docker-compose.yml mounts the notes/ folder here; nothing else persists across restarts.
 LOCAL_NOTES_DIR=$LOCAL_NOTES_DIR
+
+# Optional: user ID to always place last in note filenames
+FILENAME_LAST_USER=
+
+# SMTP (for emailing notes to participants). The container reaches a mail
+# server on this machine as host.docker.internal, never localhost.
+${SMTP_PREFIX}SMTP_HOST=$SMTP_HOST
+${SMTP_PREFIX}SMTP_PORT=$SMTP_PORT
+${SMTP_PREFIX}SMTP_FROM=$SMTP_FROM
+# Leave blank for unauthenticated local SMTP
+${SMTP_PREFIX}SMTP_USER=$SMTP_USER
+${SMTP_PREFIX}SMTP_PASSWORD=$SMTP_PASS
+
+# Optional: comma-separated user=email overrides for email lookup
+${SMTP_PREFIX}EMAIL_OVERRIDES=$EMAIL_OVERRIDES
+
+# Optional: fallback email domain when lookup fails
+MAIL_DOMAIN=
+
+# TLS for SMTP: "auto" (default) verifies certificates for real hostnames and
+# public IPs, and skips verification only for local hops (host.docker.internal,
+# localhost, private/CGNAT addresses) that cannot present a matching
+# certificate. "true"/"false" force it; any other value verifies.
+SMTP_TLS_VERIFY=auto
+# Connect/read timeout for SMTP. Without one, a dead mail host blocks the
+# service indefinitely.
+SMTP_TIMEOUT_SECONDS=30
 
 # Service settings
 POLL_INTERVAL_SECONDS=10
 AUDIO_DIR=/tmp/notetaker-audio
+
+# Persistent directory for the undelivered-email spool and for recordings
+# retained after a pipeline failure. Must NOT be a tmpfs.
+STATE_DIR=/data/notes
+# Touched every poll; the container healthcheck reads its age.
+HEARTBEAT_FILE=/tmp/notetaker-heartbeat
+# Recordings retained after a failure are deleted after this many days.
+RETAINED_AUDIO_MAX_AGE_DAYS=30
+# Set to 1 to start even if startup dependency checks fail (not recommended).
+# SKIP_PREFLIGHT=0
 ENVFILE
+chmod 600 .env
+umask 022
 
-if [ -n "$SMTP_HOST" ]; then
-    cat >> .env << ENVFILE
-
-# Email notifications
-SMTP_HOST=$SMTP_HOST
-SMTP_PORT=$SMTP_PORT
-SMTP_FROM=$SMTP_FROM
-SMTP_USER=$SMTP_USER
-SMTP_PASSWORD=$SMTP_PASS
-EMAIL_OVERRIDES=$EMAIL_OVERRIDES
-ENVFILE
-fi
-
-success ".env file created."
+success ".env file created (mode 600)."
 
 info "Building and starting the notetaker..."
 echo

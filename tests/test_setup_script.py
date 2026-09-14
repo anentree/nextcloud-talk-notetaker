@@ -8,6 +8,7 @@ touched. Assertions are on the .env it writes and on its exit status.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -53,6 +54,30 @@ exit 0
 def _write_exec(path: Path, body: str) -> None:
     path.write_text(body)
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _path_hiding(tool: str, mirror_dir: Path) -> str:
+    """Real PATH with `tool` made unresolvable. A bare stub-only PATH hides
+    everything (cat, id, the /usr/bin/env a stub's shebang needs), which isn't
+    what a machine actually missing one tool looks like. Instead, mirror (via
+    symlinks) just the PATH directories that contain `tool`, omitting it there,
+    and leave every other directory as-is."""
+    parts = []
+    for i, d in enumerate(os.environ["PATH"].split(os.pathsep)):
+        src = Path(d)
+        if src.is_dir() and (src / tool).exists():
+            mirror = mirror_dir / f"dir{i}"
+            mirror.mkdir(parents=True, exist_ok=True)
+            for entry in src.iterdir():
+                if entry.name != tool:
+                    try:
+                        (mirror / entry.name).symlink_to(entry)
+                    except OSError:
+                        pass
+            parts.append(str(mirror))
+        else:
+            parts.append(str(src))
+    return os.pathsep.join(parts)
 
 
 def run_setup(tmp_path: Path, answers: list[str], *, health="running healthy",
@@ -143,3 +168,76 @@ def test_smtp_defaults_point_at_the_docker_host(tmp_path):
     env = read_env(tmp_path)
     assert env["SMTP_HOST"] == "host.docker.internal"
     assert env["SMTP_PORT"] == "587"
+
+
+ENV_KEY_RE = re.compile(r"^#?\s*([A-Z][A-Z0-9_]+)=")
+
+
+def env_example_keys() -> set[str]:
+    keys = set()
+    for line in (REPO / ".env.example").read_text().splitlines():
+        m = ENV_KEY_RE.match(line.strip())
+        if m:
+            keys.add(m.group(1))
+    return keys
+
+
+def test_generated_env_carries_every_documented_setting(tmp_path):
+    """Whatever .env.example documents, the wizard writes (possibly commented),
+    so a user editing .env later sees every knob in one place."""
+    result = run_setup(tmp_path, answers(email="y", smtp_auth="y"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    text = (tmp_path / "work" / ".env").read_text()
+    written = {m.group(1) for m in (ENV_KEY_RE.match(l.strip()) for l in text.splitlines()) if m}
+    missing = env_example_keys() - written
+    assert not missing, f"wizard does not write: {sorted(missing)}"
+
+
+def test_env_file_is_private(tmp_path):
+    result = run_setup(tmp_path, answers())
+    assert result.returncode == 0, result.stdout + result.stderr
+    mode = stat.S_IMODE((tmp_path / "work" / ".env").stat().st_mode)
+    assert mode == 0o600, oct(mode)
+
+
+def test_rerun_backs_up_the_existing_env(tmp_path):
+    (tmp_path / "work").mkdir()
+    old = "NEXTCLOUD_URL=https://old.example.com\nGEMINI_API_KEY=old-key\n"
+    (tmp_path / "work" / ".env").write_text(old)
+    result = run_setup(tmp_path, answers())
+    assert result.returncode == 0, result.stdout + result.stderr
+    backups = sorted((tmp_path / "work").glob(".env.bak.*"))
+    assert len(backups) == 1, backups
+    assert backups[0].read_text() == old
+    assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+    assert read_env(tmp_path)["NEXTCLOUD_URL"] == "https://cloud.example.com"
+    assert backups[0].name in result.stdout
+
+
+def test_missing_curl_is_reported_up_front(tmp_path):
+    """Every connectivity test in the wizard uses curl; without it the first
+    failure would be a confusing 'Could not connect' at Step 2."""
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    _write_exec(stubs / "docker", STUB_DOCKER)
+    # Stub docker first on PATH, then the real PATH with curl hidden — a
+    # machine genuinely missing curl still has cat/id/env for everything else.
+    no_curl = _path_hiding("curl", tmp_path / "no-curl-path")
+    env = {"PATH": f"{stubs}{os.pathsep}{no_curl}", "HOME": str(tmp_path), "STUB_HEALTH": "", "STUB_LOGS": "",
+           "STUB_CALLS": str(tmp_path / "c.log")}
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copy(REPO / "setup.sh", work / "setup.sh")
+    result = subprocess.run([shutil.which("bash"), "./setup.sh"], cwd=work, input="y\n", text=True,
+                            capture_output=True, env=env, timeout=30)
+    assert result.returncode != 0
+    assert "curl" in result.stdout
+
+
+def test_empty_web_password_is_left_unset_so_the_app_falls_back(tmp_path):
+    """config.py uses the web password verbatim when the variable exists, so
+    an empty NEXTCLOUD_WEB_PASSWORD= line would break every browser login."""
+    result = run_setup(tmp_path, answers())
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NEXTCLOUD_WEB_PASSWORD" not in read_env(tmp_path)
+    assert "# NEXTCLOUD_WEB_PASSWORD=" in (tmp_path / "work" / ".env").read_text()
