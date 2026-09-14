@@ -412,7 +412,7 @@ NOTES_STORAGE=$NOTES_STORAGE
 # Nextcloud folder path for notes (used when NOTES_STORAGE=nextcloud)
 NOTES_FOLDER=$NOTES_FOLDER
 # Directory INSIDE the container for notes (used when NOTES_STORAGE=local).
-# docker-compose.yml mounts the notes/ folder here; nothing else persists across restarts.
+# docker-compose.yml mounts the notes/ folder beside it here; nothing else persists across restarts.
 LOCAL_NOTES_DIR=$LOCAL_NOTES_DIR
 
 # Optional: user ID to always place last in note filenames
