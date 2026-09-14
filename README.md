@@ -89,7 +89,7 @@ All configuration is via environment variables in `.env`:
 | `FILENAME_LAST_USER`          | No       | —                          | User ID always placed last in filenames                                        |
 | `POLL_INTERVAL_SECONDS`       | No       | `10`                       | Seconds between poll cycles                                                    |
 | `AUDIO_DIR`                   | No       | `/tmp/notetaker-audio`     | Temp directory for audio files                                                 |
-| `SMTP_HOST`                   | No       | `localhost`                | SMTP server                                                                    |
+| `SMTP_HOST`                   | No       | —                          | SMTP server. Leave it unset to disable email entirely (notes are still stored) |
 | `SMTP_PORT`                   | No       | `25`                       | SMTP port                                                                      |
 | `SMTP_FROM`                   | No       | —                          | Sender email address                                                           |
 | `SMTP_USER`                   | No       | —                          | SMTP username                                                                  |
@@ -122,7 +122,7 @@ Each call produces a markdown file with:
 - **Transcription**: Chunked pipeline — long recordings (>10 min) are split into 15-minute MP3 segments, each transcribed separately, then synthesized into final notes.
 - **Muting**: The bot uses synthetic silent audio/black video streams so other participants don't hear Chrome's fake device beep.
 - **Gemini cost**: ~$0.02 per 30-minute call on Flash Lite. Free tier (1000 req/day) is sufficient for most teams.
-- **Failure recovery**: Every Gemini call retries transient errors (503 "high demand", 429, timeouts) for about six and a half minutes with backoff. If the notes still cannot be made, the recording is moved to `<state dir>/retained-audio/` together with a `.json` sidecar holding the recipients, speaker timeline and call time, and the poll loop retries it on its own — 15 minutes later, then doubling up to every 6 hours — until the notes are stored and emailed. Recordings are pruned after `RETAINED_AUDIO_MAX_AGE_DAYS` (30). A retained `.webm` with no sidecar predates this and needs `python -m notetaker.reprocess` by hand. Emails that cannot be sent are spooled and retried the same way.
+- **Failure recovery**: Every Gemini call retries transient errors (503 "high demand", 429, timeouts) for about six and a half minutes with backoff. If the notes still cannot be made, the recording is moved to `<state dir>/retained-audio/` together with a `.json` sidecar holding the recipients, speaker timeline and call time, and the poll loop retries it on its own — 15 minutes later, then doubling up to every 6 hours — until the notes are stored (an email that could not be sent waits in the spool and is retried separately). A retry reuses the transcript and skips the email if the first attempt got that far, so nobody is emailed twice. If Gemini is still unavailable when a retry runs, the whole recording is kept for the next one; only a segment that fails for a reason that will not change (an empty answer on the same input) is skipped, and the notes then say which minutes are missing. Recordings are pruned after `RETAINED_AUDIO_MAX_AGE_DAYS` (30). A retained `.webm` with no sidecar predates this and needs `python -m notetaker.reprocess` by hand. Emails that cannot be sent are spooled and retried the same way.
 
 ## Troubleshooting
 
@@ -136,7 +136,7 @@ Each call produces a markdown file with:
 
 **No email notifications**: The bot needs subadmin status for user groups to look up email addresses. See setup instructions above.
 
-**Container keeps restarting / setup says startup checks failed**: The notetaker checks Nextcloud, the notes folder, Gemini, SMTP and its state directory at startup and refuses to run if one fails. `docker compose logs notetaker | grep PREFLIGHT` names the one that failed; fix that value in `.env` and run `docker compose up -d`.
+**Container keeps restarting / setup says startup checks failed**: The notetaker checks Nextcloud, the notes folder, Gemini, SMTP (only when `SMTP_HOST` is set) and its state directory at startup and refuses to run if one fails. `docker compose logs notetaker | grep PREFLIGHT` names the one that failed; fix that value in `.env` and run `docker compose up -d`.
 
 **Mail server on the same machine**: use `SMTP_HOST=host.docker.internal`, not `localhost` — inside the container `localhost` is the container.
 

@@ -373,8 +373,9 @@ if [ -f .env ]; then
     warn "Existing .env saved as $ENV_BACKUP"
 fi
 
-# Declined email: document the keys but leave them unset so the app keeps
-# its defaults (python-dotenv would otherwise set them to empty strings).
+# Declined email: document the keys but leave them commented out. An unset
+# SMTP_HOST is what switches email off in the app; python-dotenv would
+# otherwise set the keys to empty strings.
 if [ -n "$SMTP_HOST" ]; then
     SMTP_PREFIX=""
 else

@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 .env
+# setup.sh keeps the previous .env (and its secrets) here on a re-run
+.env.bak.*
 *.egg-info/
 dist/
 build/

@@ -18,7 +18,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 
-STUB_DOCKER = r'''#!/usr/bin/env bash
+STUB_DOCKER = r"""#!/usr/bin/env bash
 # Stub docker: enough of the CLI for setup.sh, driven by env vars.
 case "$1 $2" in
   "info ")            exit 0 ;;
@@ -31,9 +31,9 @@ case "$1 $2" in
 esac
 echo "stub docker: unhandled args: $*" >&2
 exit 99
-'''
+"""
 
-STUB_CURL = r'''#!/usr/bin/env bash
+STUB_CURL = r"""#!/usr/bin/env bash
 # Stub curl: every endpoint is reachable and answers 200/207.
 out=""; code="200"; want_code=""
 while [ $# -gt 0 ]; do
@@ -48,7 +48,7 @@ done
 # setup.sh passes -w "%{http_code}" whenever it wants the status code
 [ -n "$want_code" ] && printf '%s' "$code"
 exit 0
-'''
+"""
 
 
 def _write_exec(path: Path, body: str) -> None:
@@ -80,8 +80,14 @@ def _path_hiding(tool: str, mirror_dir: Path) -> str:
     return os.pathsep.join(parts)
 
 
-def run_setup(tmp_path: Path, answers: list[str], *, health="running healthy",
-              logs="", env_overrides: dict | None = None) -> subprocess.CompletedProcess:
+def run_setup(
+    tmp_path: Path,
+    answers: list[str],
+    *,
+    health="running healthy",
+    logs="",
+    env_overrides: dict | None = None,
+) -> subprocess.CompletedProcess:
     work = tmp_path / "work"
     work.mkdir(exist_ok=True)
     shutil.copy(REPO / "setup.sh", work / "setup.sh")
@@ -102,8 +108,13 @@ def run_setup(tmp_path: Path, answers: list[str], *, health="running healthy",
     }
     env.update(env_overrides or {})
     return subprocess.run(
-        ["bash", "./setup.sh"], cwd=work, input="\n".join(answers) + "\n",
-        text=True, capture_output=True, env=env, timeout=30,
+        ["bash", "./setup.sh"],
+        cwd=work,
+        input="\n".join(answers) + "\n",
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=30,
     )
 
 
@@ -120,17 +131,25 @@ def read_env(tmp_path: Path) -> dict[str, str]:
 
 # Answers in prompt order. Keep these in one place so a reordered prompt
 # breaks every test the same way.
-def answers(*, storage="A", folder="meeting-notes", email="n",
-            smtp_host="", smtp_port="", smtp_from="notes@example.com",
-            smtp_auth="n", overrides="n") -> list[str]:
+def answers(
+    *,
+    storage="A",
+    folder="meeting-notes",
+    email="n",
+    smtp_host="",
+    smtp_port="",
+    smtp_from="notes@example.com",
+    smtp_auth="n",
+    overrides="n",
+) -> list[str]:
     a = [
-        "y",                          # bot user created?
+        "y",  # bot user created?
         "https://cloud.example.com",  # Nextcloud URL
-        "ai-notetaker",               # bot username
-        "s3cret",                     # bot password
-        "n",                          # Yunohost SSO?
-        "AIza-test-key",              # Gemini key
-        storage,                      # A) Nextcloud  B) local
+        "ai-notetaker",  # bot username
+        "s3cret",  # bot password
+        "n",  # Yunohost SSO?
+        "AIza-test-key",  # Gemini key
+        storage,  # A) Nextcloud  B) local
     ]
     if storage == "A":
         a.append(folder)
@@ -188,7 +207,11 @@ def test_generated_env_carries_every_documented_setting(tmp_path):
     result = run_setup(tmp_path, answers(email="y", smtp_auth="y"))
     assert result.returncode == 0, result.stdout + result.stderr
     text = (tmp_path / "work" / ".env").read_text()
-    written = {m.group(1) for m in (ENV_KEY_RE.match(l.strip()) for l in text.splitlines()) if m}
+    written = {
+        m.group(1)
+        for m in (ENV_KEY_RE.match(l.strip()) for l in text.splitlines())
+        if m
+    }
     missing = env_example_keys() - written
     assert not missing, f"wizard does not write: {sorted(missing)}"
 
@@ -223,13 +246,25 @@ def test_missing_curl_is_reported_up_front(tmp_path):
     # Stub docker first on PATH, then the real PATH with curl hidden — a
     # machine genuinely missing curl still has cat/id/env for everything else.
     no_curl = _path_hiding("curl", tmp_path / "no-curl-path")
-    env = {"PATH": f"{stubs}{os.pathsep}{no_curl}", "HOME": str(tmp_path), "STUB_HEALTH": "", "STUB_LOGS": "",
-           "STUB_CALLS": str(tmp_path / "c.log")}
+    env = {
+        "PATH": f"{stubs}{os.pathsep}{no_curl}",
+        "HOME": str(tmp_path),
+        "STUB_HEALTH": "",
+        "STUB_LOGS": "",
+        "STUB_CALLS": str(tmp_path / "c.log"),
+    }
     work = tmp_path / "work"
     work.mkdir()
     shutil.copy(REPO / "setup.sh", work / "setup.sh")
-    result = subprocess.run([shutil.which("bash"), "./setup.sh"], cwd=work, input="y\n", text=True,
-                            capture_output=True, env=env, timeout=30)
+    result = subprocess.run(
+        [shutil.which("bash"), "./setup.sh"],
+        cwd=work,
+        input="y\n",
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=30,
+    )
     assert result.returncode != 0
     assert "curl" in result.stdout
 
@@ -253,7 +288,9 @@ PREFLIGHT_FAIL_LOG = (
 def test_unhealthy_container_is_reported_not_celebrated(tmp_path):
     """The app refuses to start when a dependency check fails and the
     container crash-loops. The wizard must say so and show the reason."""
-    result = run_setup(tmp_path, answers(), health="restarting unhealthy", logs=PREFLIGHT_FAIL_LOG)
+    result = run_setup(
+        tmp_path, answers(), health="restarting unhealthy", logs=PREFLIGHT_FAIL_LOG
+    )
     assert result.returncode == 1
     assert "PREFLIGHT FAILED: smtp" in result.stdout
     assert "Notetaker is running" not in result.stdout
@@ -267,7 +304,9 @@ def test_healthy_container_is_reported_running(tmp_path):
 
 def test_health_wait_times_out_loudly(tmp_path):
     """A container that never becomes healthy (stuck 'starting') is a failure too."""
-    result = run_setup(tmp_path, answers(), health="running starting", logs="still starting")
+    result = run_setup(
+        tmp_path, answers(), health="running starting", logs="still starting"
+    )
     assert result.returncode == 1
     assert "did not become healthy" in result.stdout
 
@@ -289,7 +328,10 @@ def test_compose_logs_failure_still_shows_the_fix_hint(tmp_path):
     exits non-zero, `set -e` must not abort the function before its trailing
     `info "Fix the setting..."` hint prints."""
     result = run_setup(
-        tmp_path, answers(), health="restarting unhealthy", logs=PREFLIGHT_FAIL_LOG,
+        tmp_path,
+        answers(),
+        health="restarting unhealthy",
+        logs=PREFLIGHT_FAIL_LOG,
         env_overrides={"STUB_LOGS_EXIT": "1"},
     )
     assert result.returncode == 1
@@ -299,7 +341,9 @@ def test_compose_logs_failure_still_shows_the_fix_hint(tmp_path):
 def test_setup_script_parses_and_lints():
     subprocess.run(["bash", "-n", str(REPO / "setup.sh")], check=True)
     if shutil.which("shellcheck"):
-        subprocess.run(["shellcheck", "-S", "warning", str(REPO / "setup.sh")], check=True)
+        subprocess.run(
+            ["shellcheck", "-S", "warning", str(REPO / "setup.sh")], check=True
+        )
     else:
         pytest.skip("shellcheck not installed")
 
@@ -307,17 +351,37 @@ def test_setup_script_parses_and_lints():
 def _code_env_names() -> set[str]:
     names = set()
     for py in (REPO / "src" / "notetaker").glob("*.py"):
-        names |= set(re.findall(
-            r'os\.(?:getenv|environ\.get|environ)\s*[\(\[]\s*"([A-Z][A-Z0-9_]+)"',
-            py.read_text(),
-        ))
+        names |= set(
+            re.findall(
+                r'os\.(?:getenv|environ\.get|environ)\s*[\(\[]\s*"([A-Z][A-Z0-9_]+)"',
+                py.read_text(),
+            )
+        )
     return names
 
 
 def test_env_example_and_readme_document_every_setting_the_code_reads():
     code = _code_env_names()
     assert code, "no env reads found - regex broken?"
-    readme = set(re.findall(r"^\| `([A-Z][A-Z0-9_]+)`", (REPO / "README.md").read_text(), re.M))
-    assert not code - env_example_keys(), f".env.example missing: {sorted(code - env_example_keys())}"
+    readme = set(
+        re.findall(r"^\| `([A-Z][A-Z0-9_]+)`", (REPO / "README.md").read_text(), re.M)
+    )
+    assert not code - env_example_keys(), (
+        f".env.example missing: {sorted(code - env_example_keys())}"
+    )
     assert not code - readme, f"README table missing: {sorted(code - readme)}"
-    assert not env_example_keys() - code, f".env.example documents unknown settings: {sorted(env_example_keys() - code)}"
+    assert not env_example_keys() - code, (
+        f".env.example documents unknown settings: {sorted(env_example_keys() - code)}"
+    )
+
+
+def test_env_backups_are_gitignored():
+    """A wizard re-run writes .env.bak.<stamp> holding the previous secrets.
+    .gitignore matched only .env, so `git add -A` on this public repo would
+    have staged them."""
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", ".env.bak.20260101-000000"],
+        cwd=REPO,
+        check=False,
+    )
+    assert result.returncode == 0, ".env.bak.* is not ignored"
