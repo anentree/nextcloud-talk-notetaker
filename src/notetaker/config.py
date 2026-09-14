@@ -40,6 +40,11 @@ class Config:
     local_notes_dir: str = ""
     email_overrides: dict[str, str] = field(default_factory=dict)
     mail_domain: str = ""
+    # Email is on only when SMTP_HOST is present in the environment. The
+    # wizard writes the SMTP keys commented out when email is declined; with
+    # nothing to disable, preflight used to probe localhost:25 inside the
+    # container and crash-loop the default install.
+    email_enabled: bool = True
     smtp_host: str = "localhost"
     smtp_port: int = 25
     smtp_from: str = ""
@@ -81,14 +86,8 @@ class Config:
             problems.append(
                 f"NEXTCLOUD_URL must start with http:// or https:// (got {self.nextcloud_url!r})"
             )
-        if not 1 <= self.smtp_port <= 65535:
-            problems.append(f"SMTP_PORT {self.smtp_port} is not a valid port")
-        if bool(self.smtp_user) != bool(self.smtp_password):
-            problems.append(
-                "SMTP_USER and SMTP_PASSWORD must be set together (or both left blank)"
-            )
-        if self.smtp_from and "@" not in self.smtp_from:
-            problems.append(f"SMTP_FROM is not an email address: {self.smtp_from!r}")
+        if self.email_enabled:
+            problems.extend(self._validate_smtp())
         if self.notes_storage not in ("nextcloud", "local"):
             problems.append(
                 f"NOTES_STORAGE must be 'nextcloud' or 'local' (got {self.notes_storage!r})"
@@ -101,6 +100,19 @@ class Config:
             )
         if self.poll_interval < 1:
             problems.append("POLL_INTERVAL_SECONDS must be >= 1")
+        return problems
+
+    def _validate_smtp(self) -> list[str]:
+        """SMTP checks; only meaningful when email is enabled."""
+        problems: list[str] = []
+        if not 1 <= self.smtp_port <= 65535:
+            problems.append(f"SMTP_PORT {self.smtp_port} is not a valid port")
+        if bool(self.smtp_user) != bool(self.smtp_password):
+            problems.append(
+                "SMTP_USER and SMTP_PASSWORD must be set together (or both left blank)"
+            )
+        if self.smtp_from and "@" not in self.smtp_from:
+            problems.append(f"SMTP_FROM is not an email address: {self.smtp_from!r}")
         if _normalise(self.smtp_tls_verify) not in _TLS_VERIFY_ACCEPTED:
             problems.append(
                 f"SMTP_TLS_VERIFY must be auto, true or false (got {self.smtp_tls_verify!r})"
@@ -143,6 +155,7 @@ class Config:
             local_notes_dir=os.getenv("LOCAL_NOTES_DIR", ""),
             email_overrides=_parse_email_overrides(os.getenv("EMAIL_OVERRIDES", "")),
             mail_domain=os.getenv("MAIL_DOMAIN", ""),
+            email_enabled="SMTP_HOST" in os.environ,
             smtp_host=os.getenv("SMTP_HOST", "localhost"),
             smtp_port=int(os.getenv("SMTP_PORT", "25")),
             smtp_from=os.getenv("SMTP_FROM", ""),

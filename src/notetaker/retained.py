@@ -29,6 +29,7 @@ import os
 import shutil
 import tempfile
 import time
+from datetime import datetime
 
 log = logging.getLogger(__name__)
 
@@ -54,21 +55,47 @@ def retain(
 
     ``meta`` carries the call context (token, name, call_start, speaker_events,
     attendee_ids, participants). The destination keeps the
-    ``<token>-<original name>`` shape that reprocess.py parses.
+    ``<token>-<original name>`` shape that reprocess.py parses. An earlier
+    recording of the same room on the same day has the same name; it is
+    never overwritten - the new one gets ``-<HHMMSS>`` before the extension.
     Returns the retained audio path.
     """
     now = time.time() if now is None else now
     os.makedirs(retained_dir, exist_ok=True)
-    dest = os.path.join(
-        retained_dir, f"{meta.get('token', 'unknown')}-{os.path.basename(audio_path)}"
-    )
-    shutil.move(audio_path, dest)
+    dest = _unique_dest(retained_dir, audio_path, meta, now)
 
     record = dict(meta)
     record.setdefault("attempts", 0)
     record.setdefault("created_at", now)
     record.setdefault("next_attempt_at", now + INITIAL_BACKOFF_SECONDS)
+    # Sidecar first: an audio file with no sidecar is invisible to drain()
+    # and silently pruned in 30 days, while a sidecar with no audio is
+    # dropped with a warning on the next pass. Fail towards the loud one.
     _atomic_write(sidecar_path(dest), record)
+    try:
+        shutil.move(audio_path, dest)
+    except Exception:
+        _unlink(sidecar_path(dest))
+        raise
+    return dest
+
+
+def _unique_dest(retained_dir: str, audio_path: str, meta: dict, now: float) -> str:
+    base = os.path.join(
+        retained_dir, f"{meta.get('token', 'unknown')}-{os.path.basename(audio_path)}"
+    )
+    if not os.path.exists(base):
+        return base
+    stem, ext = os.path.splitext(base)
+    try:
+        stamp = datetime.fromisoformat(meta["call_start"]).strftime("%H%M%S")
+    except (KeyError, TypeError, ValueError):
+        stamp = time.strftime("%H%M%S", time.localtime(now))
+    dest = f"{stem}-{stamp}{ext}"
+    n = 1
+    while os.path.exists(dest):
+        n += 1
+        dest = f"{stem}-{stamp}-{n}{ext}"
     return dest
 
 
@@ -91,8 +118,11 @@ def _atomic_write(path: str, record: dict) -> None:
 
 
 def pending(retained_dir: str) -> list[str]:
-    """Sidecar paths, oldest first. Recordings without a sidecar predate this
-    module and are not listed; they still need reprocess.py by hand."""
+    """Sidecar paths, oldest first by ``created_at`` (the filename starts with
+    the room token, so name order would favour some rooms over others).
+    Unreadable sidecars sort last, by name. Recordings without a sidecar
+    predate this module and are not listed; they still need reprocess.py by
+    hand."""
     if not os.path.isdir(retained_dir):
         return []
     paths = [
@@ -100,7 +130,16 @@ def pending(retained_dir: str) -> list[str]:
         for n in os.listdir(retained_dir)
         if n.endswith(SIDECAR_SUFFIX)
     ]
-    return sorted(paths)
+
+    def age_key(path: str) -> tuple[float, str]:
+        try:
+            with open(path, encoding="utf-8") as f:
+                created = float(json.load(f).get("created_at", float("inf")))
+        except (OSError, ValueError, TypeError, AttributeError):
+            created = float("inf")
+        return created, path
+
+    return sorted(paths, key=age_key)
 
 
 def _backoff_for(attempts: int) -> float:
@@ -154,8 +193,11 @@ def drain(retained_dir: str, process_fn, now: float | None = None) -> tuple[int,
             log.warning("Retained recording retry %d raised: %s", attempt, exc)
 
         if ok:
-            _unlink(path)
+            # Audio first: if we die in between, the orphan sidecar is
+            # dropped on the next pass (above); an orphan recording would
+            # sit unnoticed until prune_retained_audio() deletes it.
             _unlink(audio)
+            _unlink(path)
             log.info("Retained recording finished and removed: %s", audio)
             return 1, len(pending(retained_dir))
 

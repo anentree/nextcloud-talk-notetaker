@@ -104,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         name,
         model=cfg.gemini_model,
         participant_names=participants or None,
+        call_date=call_date or None,
     )
     log.info("Produced %d chars of notes", len(notes))
 

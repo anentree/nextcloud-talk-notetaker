@@ -208,3 +208,43 @@ def test_gemini_check_uses_the_configured_model():
 
         check_gemini(cfg)
     assert "gemini-2.5-flash-lite" in get.call_args.args[0]
+
+
+def test_preflight_skips_smtp_when_email_is_disabled(monkeypatch, tmp_path, caplog):
+    """The wizard's default answer is "no email". That writes the SMTP keys
+    commented out, so there is nothing to check — and checking localhost:25
+    inside the container is a guaranteed connection refused, which turned
+    the default install into a crash loop before 2026-09-14."""
+    monkeypatch.setenv("NEXTCLOUD_URL", "https://nc.example.com")
+    monkeypatch.setenv("NEXTCLOUD_USER", "bot")
+    monkeypatch.setenv("NEXTCLOUD_PASSWORD", "secret")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    monkeypatch.setenv("STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("SMTP_HOST", raising=False)
+    cfg = Config.from_env()
+
+    with (
+        patch("notetaker.preflight.check_smtp") as smtp,
+        patch("notetaker.preflight.check_nextcloud"),
+        patch("notetaker.preflight.check_notes_target"),
+        patch("notetaker.preflight.check_gemini"),
+        caplog.at_level("INFO", logger="notetaker.preflight"),
+    ):
+        failures = run_preflight(cfg)
+
+    assert failures == []
+    smtp.assert_not_called()
+    assert "SMTP_HOST" in caplog.text, "say why the smtp check was skipped"
+
+
+def test_preflight_still_checks_smtp_when_email_is_enabled(tmp_path):
+    cfg = make_cfg(state_dir=str(tmp_path))
+    assert cfg.email_enabled is True
+    with (
+        patch("notetaker.preflight.check_smtp") as smtp,
+        patch("notetaker.preflight.check_nextcloud"),
+        patch("notetaker.preflight.check_notes_target"),
+        patch("notetaker.preflight.check_gemini"),
+    ):
+        run_preflight(cfg)
+    smtp.assert_called_once()

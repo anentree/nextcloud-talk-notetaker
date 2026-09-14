@@ -88,6 +88,77 @@ def test_retain_keeps_the_old_filename_shape(tmp_path):
     assert parse_retained_name(dest) == ("itujzrjw", "2026-09-08", "Accounting Talk")
 
 
+def test_retain_never_overwrites_an_earlier_recording_of_the_same_room(tmp_path):
+    """Two failed calls in one room on one day produce the same audio name
+    (<date>-<slug>.webm), so the second retain() used to shutil.move over the
+    first recording and its sidecar without a word."""
+    first = _retain(tmp_path, _meta(call_start="2026-09-08T09:01:39"), now=1.0)
+    (tmp_path / "work" / "2026-09-08-accounting-talk.webm").write_bytes(b"second")
+    second = retained.retain(
+        str(tmp_path / "retained"),
+        str(tmp_path / "work" / "2026-09-08-accounting-talk.webm"),
+        _meta(call_start="2026-09-08T16:01:39"),
+        now=2.0,
+    )
+
+    assert first != second
+    assert os.path.basename(second) == "itujzrjw-2026-09-08-accounting-talk-160139.webm"
+    with open(first, "rb") as f:
+        assert f.read() == b"audio"
+    with open(second, "rb") as f:
+        assert f.read() == b"second"
+    assert _load(retained.sidecar_path(first))["created_at"] == 1.0
+    assert _load(retained.sidecar_path(second))["created_at"] == 2.0
+    assert len(retained.pending(str(tmp_path / "retained"))) == 2
+
+
+def test_retain_disambiguates_without_a_call_start_and_never_collides(tmp_path):
+    d = str(tmp_path / "retained")
+    meta = {"token": "tok", "name": "A"}
+    dests = set()
+    for i in range(3):
+        src = tmp_path / "2026-09-08-a.webm"
+        src.write_bytes(b"x")
+        with patch(
+            "notetaker.retained.time.localtime",
+            return_value=(2026, 9, 8, 16, 1, 39, 0, 251, 0),
+        ):
+            dests.add(retained.retain(d, str(src), dict(meta), now=float(i)))
+    assert len(dests) == 3
+    assert len(retained.pending(d)) == 3
+
+
+def test_retain_writes_the_sidecar_before_moving_the_audio(tmp_path):
+    """If the sidecar write fails, the audio must still be where the log says
+    it is (the working dir), not sitting in retained-audio/ without a sidecar
+    where nothing will ever retry it and prune deletes it in 30 days."""
+    src = tmp_path / "work" / "2026-09-08-accounting-talk.webm"
+    src.parent.mkdir()
+    src.write_bytes(b"audio")
+    with (
+        patch("notetaker.retained._atomic_write", side_effect=OSError("disk full")),
+        pytest.raises(OSError),
+    ):
+        retained.retain(str(tmp_path / "retained"), str(src), _meta(), now=1.0)
+    assert src.exists()
+    assert not os.listdir(tmp_path / "retained")
+
+
+def test_retain_removes_the_sidecar_if_the_move_fails(tmp_path):
+    """The reverse: a sidecar with no audio would just be dropped by drain()
+    with a warning, hiding that the recording is still in tmpfs."""
+    src = tmp_path / "work" / "2026-09-08-accounting-talk.webm"
+    src.parent.mkdir()
+    src.write_bytes(b"audio")
+    with (
+        patch("notetaker.retained.shutil.move", side_effect=OSError("cross-device")),
+        pytest.raises(OSError),
+    ):
+        retained.retain(str(tmp_path / "retained"), str(src), _meta(), now=1.0)
+    assert src.exists()
+    assert not os.listdir(tmp_path / "retained")
+
+
 # --- drain() ------------------------------------------------------------------
 
 
@@ -116,6 +187,29 @@ def test_drain_retries_and_removes_on_success(tmp_path):
     assert meta["participants"][0]["email"] == "b@x.com"
     assert not os.path.exists(dest)
     assert not os.path.exists(retained.sidecar_path(dest))
+
+
+def test_drain_removes_the_audio_before_the_sidecar(tmp_path):
+    """A crash between the two unlinks must leave a sidecar without audio
+    (which drain() drops on the next pass), never audio without a sidecar
+    (which nothing looks at for 30 days)."""
+    _retain(tmp_path, now=1000.0)
+    order = []
+    real_unlink = os.unlink
+
+    def spy(path):
+        order.append(os.path.basename(path))
+        real_unlink(path)
+
+    with patch("notetaker.retained.os.unlink", spy):
+        retained.drain(
+            str(tmp_path / "retained"), MagicMock(return_value=True), now=1e9
+        )
+
+    assert order == [
+        "itujzrjw-2026-09-08-accounting-talk.webm",
+        "itujzrjw-2026-09-08-accounting-talk.webm.json",
+    ]
 
 
 def test_drain_backs_off_when_the_retry_fails_again(tmp_path):
@@ -153,9 +247,13 @@ def test_drain_treats_a_false_return_as_failure(tmp_path):
 
 
 def test_drain_retries_at_most_one_recording_per_call(tmp_path):
-    """Each retry blocks the poll loop for minutes; never chain them."""
-    _retain(tmp_path, _meta(token="aaaa"), now=1000.0)
-    _retain(tmp_path, _meta(token="bbbb"), now=1001.0)
+    """Each retry blocks the poll loop for minutes; never chain them.
+
+    "Oldest first" is by created_at. The filename starts with the room
+    token, so sorting by name would let a room called "aaaa" starve one
+    called "zzzz" no matter how long the latter has waited."""
+    _retain(tmp_path, _meta(token="zzzz"), now=1000.0)
+    _retain(tmp_path, _meta(token="aaaa"), now=1001.0)
     process = MagicMock(return_value=True)
 
     done, remaining = retained.drain(
@@ -164,7 +262,20 @@ def test_drain_retries_at_most_one_recording_per_call(tmp_path):
 
     assert process.call_count == 1
     assert (done, remaining) == (1, 1)
-    assert process.call_args.args[0]["token"] == "aaaa", "oldest first"
+    assert process.call_args.args[0]["token"] == "zzzz", "oldest first"
+
+
+def test_pending_orders_by_created_at_and_tolerates_a_bad_sidecar(tmp_path):
+    d = tmp_path / "retained"
+    _retain(tmp_path, _meta(token="zzzz"), now=1000.0)
+    _retain(tmp_path, _meta(token="aaaa"), now=1001.0)
+    (d / "mmmm-2026-09-01-call.webm.json").write_text("{not json")
+
+    names = [os.path.basename(p) for p in retained.pending(str(d))]
+
+    assert names[0].startswith("zzzz-")
+    assert names[1].startswith("aaaa-")
+    assert names[2].startswith("mmmm-"), "unreadable sidecars sort last, by name"
 
 
 def test_drain_drops_a_sidecar_whose_audio_was_pruned(tmp_path):
@@ -310,8 +421,12 @@ def test_retry_resolves_recipients_if_the_live_call_died_before_it_could(
     mock_email,
     tmp_path,
 ):
-    """If Nextcloud itself was down, the sidecar has attendee_ids but no
-    participants; the retry must look them up rather than email nobody."""
+    """participants.get_participant_emails() returns [] when Nextcloud is
+    down — it never raises. So the sidecar of a call that failed while
+    Nextcloud was out carries participants=[] with attendee_ids present, and
+    the retry must look them up again rather than treat [] as final. Before
+    2026-09-14 it only re-resolved on None: the retry uploaded the notes,
+    deleted the recording and emailed nobody, ever."""
     from notetaker.main import drain_retained, handle_call
 
     cfg = _cfg(tmp_path)
@@ -321,29 +436,187 @@ def test_retry_resolves_recipients_if_the_live_call_died_before_it_could(
     mock_recorder = MagicMock()
     mock_recorder.record_call = AsyncMock(return_value=(str(audio), [], {"brantley"}))
     mock_recorder_cls.return_value = mock_recorder
-    mock_participants.side_effect = RuntimeError("Nextcloud 502")
+    mock_participants.return_value = []  # Nextcloud down: the real contract
+    mock_transcribe.return_value = "# Notes"
+    mock_upload.side_effect = RuntimeError("Nextcloud 502")  # still down
 
-    with pytest.raises(RuntimeError):
-        asyncio.run(
-            handle_call(cfg, {"token": "itujzrjw", "displayName": "Accounting Talk"})
-        )
+    asyncio.run(
+        handle_call(cfg, {"token": "itujzrjw", "displayName": "Accounting Talk"})
+    )
 
     dest = os.path.join(
         cfg.retained_audio_dir, "itujzrjw-2026-09-08-accounting-talk.webm"
     )
-    assert _load(retained.sidecar_path(dest))["participants"] is None
+    assert _load(retained.sidecar_path(dest))["participants"] == []
+    mock_email.assert_not_called()
 
-    mock_participants.side_effect = None
+    # Nextcloud is back.
+    mock_participants.reset_mock()
     mock_participants.return_value = [
         {"user_id": "brantley", "display_name": "Brantley Gunn", "email": "b@x.com"}
     ]
-    mock_transcribe.return_value = "# Notes"
+    mock_upload.side_effect = None
     with patch("notetaker.retained.time.time", return_value=9e9):
         drain_retained(cfg)
 
+    mock_participants.assert_called_once()
     assert mock_participants.call_args.kwargs["attendee_ids"] == {"brantley"}
     mock_email.assert_called_once()
+    assert [r["email"] for r in mock_email.call_args.args[1]["recipients"]] == [
+        "b@x.com"
+    ]
     assert not os.path.exists(dest)
+
+
+@patch("notetaker.main.deliver_notes")
+@patch("notetaker.main.upload_notes")
+@patch("notetaker.main.get_participant_emails")
+@patch("notetaker.main.transcribe_and_summarize")
+@patch("notetaker.main.AudioRecorder")
+def test_retry_does_not_re_resolve_when_nobody_attended(
+    mock_recorder_cls,
+    mock_transcribe,
+    mock_participants,
+    mock_upload,
+    mock_email,
+    tmp_path,
+):
+    """[] with no attendee_ids is a real answer (nobody to email), not a
+    failed lookup; the retry must not fall back to room membership."""
+    from notetaker.main import drain_retained, handle_call
+
+    cfg = _cfg(tmp_path)
+    audio = tmp_path / "work" / "2026-09-08-accounting-talk.webm"
+    audio.parent.mkdir()
+    audio.write_bytes(b"audio")
+    mock_recorder = MagicMock()
+    mock_recorder.record_call = AsyncMock(return_value=(str(audio), [], set()))
+    mock_recorder_cls.return_value = mock_recorder
+    mock_participants.return_value = []
+    mock_transcribe.return_value = "# Notes"
+    mock_upload.side_effect = RuntimeError("Nextcloud 502")
+
+    asyncio.run(
+        handle_call(cfg, {"token": "itujzrjw", "displayName": "Accounting Talk"})
+    )
+
+    mock_participants.reset_mock()
+    mock_upload.side_effect = None
+    with patch("notetaker.retained.time.time", return_value=9e9):
+        drain_retained(cfg)
+
+    mock_participants.assert_not_called()
+    mock_email.assert_not_called()
+
+
+# --- I2: a retry must not redo work the live call already finished ------------
+
+
+@patch("notetaker.main.deliver_notes", return_value=True)
+@patch("notetaker.main.upload_notes", side_effect=RuntimeError("Nextcloud 502"))
+@patch("notetaker.main.get_participant_emails")
+@patch("notetaker.main.transcribe_and_summarize", return_value="# Notes")
+@patch("notetaker.main.AudioRecorder")
+def test_retry_reuses_the_notes_and_does_not_email_twice(
+    mock_recorder_cls,
+    mock_transcribe,
+    mock_participants,
+    mock_upload,
+    mock_email,
+    tmp_path,
+):
+    """Upload failed but the email went out. The recording is retained (the
+    notes are not in durable storage), but the retry must only redo the
+    upload: transcribing again costs Gemini quota and yields different text,
+    and emailing again sends every attendee a duplicate on every attempt."""
+    from notetaker.main import drain_retained, handle_call
+
+    cfg = _cfg(tmp_path)
+    audio = tmp_path / "work" / "2026-09-08-accounting-talk.webm"
+    audio.parent.mkdir()
+    audio.write_bytes(b"audio")
+    rec = MagicMock()
+    rec.record_call = AsyncMock(return_value=(str(audio), [], {"brantley"}))
+    mock_recorder_cls.return_value = rec
+    mock_participants.return_value = [
+        {"user_id": "brantley", "display_name": "Brantley Gunn", "email": "b@x.com"}
+    ]
+
+    asyncio.run(
+        handle_call(cfg, {"token": "itujzrjw", "displayName": "Accounting Talk"})
+    )
+    assert mock_email.call_count == 1
+
+    dest = os.path.join(
+        cfg.retained_audio_dir, "itujzrjw-2026-09-08-accounting-talk.webm"
+    )
+    sidecar = _load(retained.sidecar_path(dest))
+    assert sidecar["notes"] == "# Notes"
+    assert sidecar["email_done"] is True
+
+    # Still down at the first retry: nothing is redone, the sidecar keeps
+    # both facts for the next one.
+    with patch("notetaker.retained.time.time", return_value=9e9):
+        drain_retained(cfg)
+    assert mock_transcribe.call_count == 1
+    assert mock_email.call_count == 1
+    sidecar = _load(retained.sidecar_path(dest))
+    assert sidecar["notes"] == "# Notes" and sidecar["email_done"] is True
+    assert sidecar["attempts"] == 1
+
+    # Nextcloud back: one upload, nothing else, recording gone.
+    mock_upload.reset_mock()
+    mock_upload.side_effect = None
+    with patch("notetaker.retained.time.time", return_value=9e9 + 1e6):
+        drain_retained(cfg)
+
+    mock_upload.assert_called_once()
+    assert mock_upload.call_args.args[-1] == "# Notes"
+    assert mock_transcribe.call_count == 1
+    assert mock_email.call_count == 1
+    assert not os.path.exists(dest)
+    assert not os.path.exists(retained.sidecar_path(dest))
+
+
+@patch("notetaker.main.deliver_notes", return_value=False)
+@patch("notetaker.main.upload_notes", side_effect=RuntimeError("Nextcloud 502"))
+@patch("notetaker.main.get_participant_emails")
+@patch("notetaker.main.transcribe_and_summarize", return_value="# Notes")
+@patch("notetaker.main.AudioRecorder")
+def test_a_spooled_email_also_counts_as_done(
+    mock_recorder_cls,
+    mock_transcribe,
+    mock_participants,
+    mock_upload,
+    mock_email,
+    tmp_path,
+):
+    """deliver_notes() returning False means the email is in the spool, which
+    retries it on its own. The retained retry must not queue a second copy."""
+    from notetaker.main import drain_retained, handle_call
+
+    cfg = _cfg(tmp_path)
+    audio = tmp_path / "work" / "2026-09-08-accounting-talk.webm"
+    audio.parent.mkdir()
+    audio.write_bytes(b"audio")
+    rec = MagicMock()
+    rec.record_call = AsyncMock(return_value=(str(audio), [], {"brantley"}))
+    mock_recorder_cls.return_value = rec
+    mock_participants.return_value = [
+        {"user_id": "brantley", "display_name": "Brantley Gunn", "email": "b@x.com"}
+    ]
+
+    asyncio.run(
+        handle_call(cfg, {"token": "itujzrjw", "displayName": "Accounting Talk"})
+    )
+    assert mock_email.call_count == 1
+    mock_upload.reset_mock()
+    mock_upload.side_effect = None
+    with patch("notetaker.retained.time.time", return_value=9e9):
+        drain_retained(cfg)
+
+    assert mock_email.call_count == 1
+    mock_upload.assert_called_once()
 
 
 def test_prune_removes_the_sidecar_with_the_audio(tmp_path):

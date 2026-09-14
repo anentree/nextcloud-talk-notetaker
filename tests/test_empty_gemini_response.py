@@ -18,7 +18,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from notetaker.transcriber import _gemini_call, transcribe_and_summarize
+from notetaker.transcriber import (
+    EmptyGeminiResponse,
+    _gemini_call,
+    transcribe_and_summarize,
+)
 
 
 def _response(text, finish_reason="STOP"):
@@ -52,7 +56,9 @@ def test_gemini_call_never_returns_none():
 
 
 def test_gemini_call_retries_empty_then_succeeds():
-    """An empty response is transient — the existing retry loop must engage."""
+    """An empty response gets exactly one retry: it is usually deterministic
+    (MAX_TOKENS, SAFETY, RECITATION on the same input), but one retry is
+    cheap insurance against the odd flake."""
     client = MagicMock()
     client.models.generate_content.side_effect = [
         _response(None, "MAX_TOKENS"),
@@ -64,6 +70,23 @@ def test_gemini_call_retries_empty_then_succeeds():
 
     assert result == "recovered text"
     assert client.models.generate_content.call_count == 2
+
+
+def test_persistently_empty_response_gives_up_after_two_calls():
+    """Each attempt re-uploads the whole segment. Walking the full 8-attempt,
+    395-second transient budget for a response that will be empty every
+    time is pure cost - and delays the notes for the rest of the meeting."""
+    client = MagicMock()
+    client.models.generate_content.return_value = _response(None, "SAFETY")
+
+    with (
+        patch("notetaker.transcriber.time.sleep") as sleep,
+        pytest.raises(EmptyGeminiResponse),
+    ):
+        _gemini_call(client, ["prompt"])
+
+    assert client.models.generate_content.call_count == 2
+    assert sum(c.args[0] for c in sleep.call_args_list) < 60
 
 
 def _ffmpeg_side_effect(args, **kwargs):
@@ -89,8 +112,9 @@ def test_one_dead_segment_does_not_discard_the_others(
     good = "Speaker said something substantial. " * 600  # passes the density gate
 
     def responses():
-        # segments 1-3 fine, segment 4 permanently empty (3 retries),
-        # segments 5-6 fine, then the synthesis call.
+        # segments 1-3 fine, segment 4 empty on both of its attempts, the
+        # third empty is segment 5's first try (it recovers on its retry),
+        # segment 6 fine, then the synthesis call.
         yield _response(good)
         yield _response(good)
         yield _response(good)

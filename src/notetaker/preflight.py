@@ -114,13 +114,21 @@ def run_preflight(cfg: Config) -> list[str]:
     """
     # Resolved at call time rather than captured in a module-level tuple, so
     # the individual checks stay independently patchable in tests.
-    checks = (
+    checks = [
         ("state-dir", check_state_dir),
         ("smtp", check_smtp),
         ("nextcloud", check_nextcloud),
         ("notes-target", check_notes_target),
         ("gemini", check_gemini),
-    )
+    ]
+    if not cfg.email_enabled:
+        # Nothing to probe, and localhost:25 inside the container is a
+        # guaranteed connection refused — the crash loop behind the wizard's
+        # default "no email" answer before 2026-09-14.
+        log.info(
+            "PREFLIGHT skipping smtp: email is disabled because SMTP_HOST is unset"
+        )
+        checks = [c for c in checks if c[0] != "smtp"]
 
     failures: list[str] = []
 

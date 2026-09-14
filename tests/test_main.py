@@ -118,3 +118,77 @@ def test_build_notes_filename_no_last_user():
     now = datetime(2026, 3, 11, 14, 30)
     result = _build_notes_filename(participants, now, last_user="")
     assert result == "2026-03-11-1430-bob.md"
+
+
+@patch("notetaker.main.os.unlink")
+@patch("notetaker.main.os.path.getsize", return_value=1024)
+@patch("notetaker.main.deliver_notes")
+@patch("notetaker.main.upload_notes")
+@patch("notetaker.main.get_participant_emails")
+@patch("notetaker.main.transcribe_and_summarize")
+@patch("notetaker.main.AudioRecorder")
+def test_handle_call_does_not_email_when_email_is_disabled(
+    mock_recorder_cls,
+    mock_transcribe,
+    mock_participants,
+    mock_upload,
+    mock_email,
+    mock_getsize,
+    mock_unlink,
+):
+    """No SMTP_HOST means no mail server to talk to. The notes are still
+    stored; the email step is skipped rather than attempted and spooled."""
+    mock_recorder = MagicMock()
+    mock_recorder.record_call = AsyncMock(
+        return_value=("/tmp/audio.wav", [], {"alice"})
+    )
+    mock_recorder_cls.return_value = mock_recorder
+    mock_transcribe.return_value = "# Meeting: Standup\n\n## Summary\nGood stuff."
+    mock_participants.return_value = [
+        {"user_id": "alice", "display_name": "Alice", "email": "alice@example.com"},
+    ]
+    cfg = Config(
+        nextcloud_url="https://nc.example.com",
+        nextcloud_user="bot",
+        nextcloud_password="secret",
+        nextcloud_web_password="secret",
+        gemini_api_key="gemini-key",
+        email_enabled=False,
+    )
+
+    asyncio.run(handle_call(cfg, {"token": "abc123", "displayName": "Standup"}))
+
+    mock_upload.assert_called_once()
+    mock_email.assert_not_called()
+    mock_unlink.assert_called_once_with("/tmp/audio.wav")
+
+
+def test_finish_recording_dates_the_notes_by_the_call_not_the_retry(tmp_path):
+    """A retained recording is retried hours or days later; the notes must
+    carry the date the call happened."""
+    from notetaker.main import _finish_recording
+
+    cfg = Config(
+        nextcloud_url="https://nc.example.com",
+        nextcloud_user="bot",
+        nextcloud_password="secret",
+        nextcloud_web_password="secret",
+        gemini_api_key="gemini-key",
+        notes_storage="local",
+        local_notes_dir=str(tmp_path / "notes"),
+        heartbeat_file=str(tmp_path / "hb"),
+    )
+    meta = {
+        "token": "t",
+        "name": "Call",
+        "call_start": "2026-09-08T16:01:39",
+        "speaker_events": [],
+    }
+    audio = tmp_path / "a.webm"
+    audio.write_bytes(b"x")
+    with (
+        patch("notetaker.main.transcribe_and_summarize", return_value="# N") as tr,
+        patch("notetaker.main.deliver_notes", return_value=True),
+    ):
+        assert _finish_recording(cfg, meta, str(audio), []) is True
+    assert tr.call_args.kwargs["call_date"] == "2026-09-08"

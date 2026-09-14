@@ -17,3 +17,28 @@ def test_unparseable_name_still_yields_a_usable_conversation_name():
     assert token == ""
     assert call_date == ""
     assert name == "Some Recording"
+
+
+def test_reprocess_passes_the_date_from_the_filename(monkeypatch, tmp_path):
+    """The retained name carries the call date; the notes must use it, not
+    the day someone got round to reprocessing."""
+    from unittest.mock import patch
+
+    from notetaker import reprocess
+
+    monkeypatch.setenv("NEXTCLOUD_URL", "https://nc.example.com")
+    monkeypatch.setenv("NEXTCLOUD_USER", "bot")
+    monkeypatch.setenv("NEXTCLOUD_PASSWORD", "secret")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    audio = tmp_path / "92gwpi2v-2026-08-25-brantley-gunn-jo.webm"
+    audio.write_bytes(b"x")
+
+    with patch("notetaker.reprocess.transcribe_and_summarize", return_value="n") as tr:
+        assert reprocess.main([str(audio), "--dry-run"]) == 0
+    assert tr.call_args.kwargs["call_date"] == "2026-08-25"
+
+    undated = tmp_path / "some-recording.webm"
+    undated.write_bytes(b"x")
+    with patch("notetaker.reprocess.transcribe_and_summarize", return_value="n") as tr:
+        assert reprocess.main([str(undated), "--dry-run"]) == 0
+    assert tr.call_args.kwargs["call_date"] is None

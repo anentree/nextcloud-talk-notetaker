@@ -133,3 +133,107 @@ def test_heartbeat_reaches_the_segment_calls(tmp_path):
 
     assert out == "text"
     assert beats.call_count >= 2, "retry sleeps inside a segment did not beat"
+
+
+# --- A segment lost to an outage must not become permanently incomplete notes
+
+
+def _fake_ffmpeg(args, **kw):
+    for a in reversed(args):
+        if isinstance(a, str) and a.endswith(".mp3"):
+            with open(a, "wb") as f:
+                f.write(b"mp3")
+            break
+    return MagicMock(returncode=0)
+
+
+def _prompts_of(contents):
+    return [c for c in contents if isinstance(c, str)]
+
+
+def test_segment_lost_to_an_outage_fails_the_whole_recording(tmp_path):
+    """Before 2026-09-14 the chunk loop swallowed a segment whose transient
+    retries were exhausted, synthesised notes with a hole in them, wrote
+    "the recording is retained" over the top - and the caller, seeing notes,
+    deleted the recording. On the retry path an outage ending mid-retry
+    turned a fully retained recording into permanently incomplete notes.
+    An outage is not a segment problem: raise, keep the recording intact,
+    and let retained.py try the whole thing again later."""
+    client = MagicMock()
+    seen = []
+
+    def gen(model, contents, config):
+        seen.append(_prompts_of(contents))
+        if any("segment 2 of 3" in p for p in _prompts_of(contents)):
+            raise _busy()
+        return _response("Speaker said something substantial. " * 600)
+
+    client.models.generate_content.side_effect = gen
+    audio = tmp_path / "a.webm"
+    audio.write_bytes(b"x")
+
+    with (
+        patch("notetaker.transcriber.genai") as genai,
+        patch("notetaker.transcriber.subprocess.run", _fake_ffmpeg),
+        patch("notetaker.transcriber._get_audio_duration", return_value=2700.0),
+        patch("notetaker.transcriber.time.sleep"),
+        pytest.raises(transcriber.UpstreamUnavailable),
+    ):
+        genai.Client.return_value = client
+        transcriber.transcribe_and_summarize("key", str(audio), "Call")
+
+    synthesis_calls = [p for p in seen if any("SEGMENT TRANSCRIPTS" in s for s in p)]
+    assert synthesis_calls == [], "no notes must be synthesised around the hole"
+
+
+def test_gemini_call_names_an_exhausted_outage_distinctly():
+    client = MagicMock()
+    client.models.generate_content.side_effect = _busy()
+
+    with (
+        patch("notetaker.transcriber.time.sleep"),
+        pytest.raises(transcriber.UpstreamUnavailable) as exc_info,
+    ):
+        _gemini_call(client, ["prompt"])
+
+    assert client.models.generate_content.call_count == transcriber.MAX_RETRIES
+    assert "503" in str(exc_info.value), "keep the upstream reason in the message"
+
+
+def test_deterministic_segment_failure_still_yields_notes_with_a_warning(tmp_path):
+    """An empty response on the same input is not an outage; the rest of the
+    meeting must still be written up, with the gap disclosed."""
+    client = MagicMock()
+
+    def gen(model, contents, config):
+        if any("segment 2 of 3" in p for p in _prompts_of(contents)):
+            return _response(None)
+        return _response("Speaker said something substantial. " * 600)
+
+    client.models.generate_content.side_effect = gen
+    audio = tmp_path / "a.webm"
+    audio.write_bytes(b"x")
+
+    with (
+        patch("notetaker.transcriber.genai") as genai,
+        patch("notetaker.transcriber.subprocess.run", _fake_ffmpeg),
+        patch("notetaker.transcriber._get_audio_duration", return_value=2700.0),
+        patch("notetaker.transcriber.time.sleep"),
+    ):
+        genai.Client.return_value = client
+        notes = transcriber.transcribe_and_summarize("key", str(audio), "Call")
+
+    assert "Incomplete transcript" in notes
+    assert "Segment 2: minutes 15–30" in notes
+
+
+def test_coverage_warning_does_not_promise_a_retained_recording():
+    """The caller deletes the recording once notes exist, so the warning
+    must not tell the reader it can be reprocessed later."""
+    out = transcriber._prepend_coverage_warning(
+        "# Notes", [(2, 900.0, 1800.0, "no text part")], 3
+    )
+    assert "retained" not in out.lower()
+    assert "reprocess" not in out.lower()
+    assert "could not be transcribed" in out
+    assert "15–30" in out

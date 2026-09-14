@@ -21,6 +21,11 @@ log = logging.getLogger(__name__)
 MAX_RETRIES = 8
 RETRY_BASE_DELAY = 5  # seconds
 RETRY_MAX_DELAY = 120  # seconds
+# An empty response (MAX_TOKENS, SAFETY, RECITATION) is mostly deterministic
+# on the same input, and every attempt re-uploads the whole segment. One
+# retry covers the odd flake; the full transient budget would cost 395s and
+# eight uploads to learn nothing new.
+EMPTY_RESPONSE_ATTEMPTS = 2
 # The container healthcheck declares the process dead after roughly 170s
 # without a heartbeat, so a long backoff sleep must be sliced with beats.
 HEARTBEAT_SLICE = 30  # seconds
@@ -47,6 +52,19 @@ class EmptyGeminiResponse(RuntimeError):
     """
 
 
+class UpstreamUnavailable(RuntimeError):
+    """Gemini stayed unavailable for the whole transient retry budget.
+
+    Distinct from a per-segment failure on purpose: the chunk loop swallows
+    a segment that cannot be transcribed so the rest of the meeting survives,
+    but an outage is not a property of the segment. Swallowing it produced
+    notes with a hole in them, after which the caller deleted the recording
+    - and on the retry path an outage ending mid-retry turned a fully
+    retained recording into permanently incomplete notes. This propagates
+    so the whole recording is retained intact and tried again later.
+    """
+
+
 SEGMENT_PROMPT = """You are a professional meeting transcriber. This audio is segment {seg_num} of {total_segs} from a Nextcloud Talk call named "{conversation_name}" on {date}.
 
 This segment covers approximately minutes {start_min} to {end_min} of the call.
@@ -59,7 +77,7 @@ CRITICAL RULES:
 - If the timeline labels are generic (e.g. "Speaker 1") or absent, separate speakers by voice and KEEP the generic labels ("Speaker 1", "Speaker 2"). Only use a real name when someone is addressed by name in the audio or introduces themselves. NEVER assign a name from the participant list just because it is on the list — an unnamed speaker must stay unnamed.
 - The number of distinct speakers is whatever you can actually hear. Do NOT try to match the length of the participant list. A two-person call with four people on the roster has TWO speakers.
 - If an interval is marked `[overlap]`, note crosstalk between the listed speakers.
-- Use today's date ({date}) for any date references.
+- The call took place on {date}; use that date for any date references.
 
 Produce a detailed transcript of this segment in this format:
 
@@ -125,7 +143,7 @@ Subject: Meeting Notes — {conversation_name} — {date}
 
 Hi everyone,
 
-Here's a summary of our call today ({duration_min} minutes):
+Here's a summary of our call on {date} ({duration_min} minutes):
 
 [3-5 sentence overview of the main topics and outcomes]
 
@@ -360,6 +378,20 @@ def _sleep_with_heartbeat(delay: float, heartbeat_fn=None) -> None:
                 log.debug("Heartbeat callback failed", exc_info=True)
 
 
+TRANSIENT_MARKERS = (
+    "429",
+    "resource_exhausted",
+    "503",
+    "500",
+    "unavailable",
+    "deadline",
+    "timeout",
+    "connection",
+    "reset",
+    "broken pipe",
+)
+
+
 def _gemini_call(
     client: genai.Client,
     contents: list,
@@ -367,8 +399,15 @@ def _gemini_call(
     model: str = "gemini-2.5-flash-lite",
     heartbeat_fn=None,
 ) -> str:
-    """Make a Gemini API call with retry logic for all transient errors."""
-    for attempt in range(1, MAX_RETRIES + 1):
+    """Make a Gemini API call with retry logic for all transient errors.
+
+    Raises UpstreamUnavailable once a transient error has used up
+    MAX_RETRIES, EmptyGeminiResponse after EMPTY_RESPONSE_ATTEMPTS empty
+    answers, and anything else (a bad key, a malformed request) at once.
+    """
+    attempt = 0  # transient errors
+    empty = 0  # HTTP 200 with no text part
+    while True:
         try:
             response = client.models.generate_content(
                 model=model,
@@ -383,35 +422,36 @@ def _gemini_call(
                     f"max_output_tokens={max_output_tokens})"
                 )
             return text
+        except EmptyGeminiResponse as exc:
+            empty += 1
+            if empty >= EMPTY_RESPONSE_ATTEMPTS:
+                raise
+            log.warning(
+                "Gemini empty response (attempt %d/%d): %s. Retrying in %ds...",
+                empty,
+                EMPTY_RESPONSE_ATTEMPTS,
+                exc,
+                RETRY_BASE_DELAY,
+            )
+            _sleep_with_heartbeat(RETRY_BASE_DELAY, heartbeat_fn)
         except Exception as exc:
             exc_str = str(exc).lower()
-            is_transient = isinstance(exc, EmptyGeminiResponse) or any(
-                s in exc_str
-                for s in [
-                    "429",
-                    "resource_exhausted",
-                    "503",
-                    "500",
-                    "unavailable",
-                    "deadline",
-                    "timeout",
-                    "connection",
-                    "reset",
-                    "broken pipe",
-                ]
-            )
-            if is_transient and attempt < MAX_RETRIES:
-                delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
-                log.warning(
-                    "Gemini error (attempt %d/%d): %s. Retrying in %ds...",
-                    attempt,
-                    MAX_RETRIES,
-                    exc,
-                    delay,
-                )
-                _sleep_with_heartbeat(delay, heartbeat_fn)
-            else:
+            if not any(marker in exc_str for marker in TRANSIENT_MARKERS):
                 raise
+            attempt += 1
+            if attempt >= MAX_RETRIES:
+                raise UpstreamUnavailable(
+                    f"Gemini still unavailable after {attempt} attempts: {exc}"
+                ) from exc
+            delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
+            log.warning(
+                "Gemini error (attempt %d/%d): %s. Retrying in %ds...",
+                attempt,
+                MAX_RETRIES,
+                exc,
+                delay,
+            )
+            _sleep_with_heartbeat(delay, heartbeat_fn)
 
 
 def _transcribe_chunk(
@@ -422,7 +462,7 @@ def _transcribe_chunk(
     start_sec: float,
     end_sec: float,
     conversation_name: str,
-    today: str,
+    call_date: str,
     model: str = "gemini-2.5-flash-lite",
     speaker_events: list[dict] | None = None,
     participant_names: list[str] | None = None,
@@ -439,7 +479,7 @@ def _transcribe_chunk(
         seg_num=seg_num,
         total_segs=total_segs,
         conversation_name=conversation_name,
-        date=today,
+        date=call_date,
         start_min=int(start_sec / 60),
         end_min=int(end_sec / 60),
         timeline_block=timeline_block,
@@ -497,10 +537,10 @@ def _prepend_coverage_warning(
         lines.append(
             f"> - Segment {seg_num}: minutes {int(start / 60)}–{int(end / 60)} — {reason}"
         )
-    lines.append(
-        "> \n> The recording is retained and can be reprocessed with "
-        "`python -m notetaker.reprocess`."
-    )
+    # No promise of a later fix: once notes exist the caller deletes the
+    # recording, and a segment that fails this way (an empty answer on the
+    # same input) would fail the same way again.
+    lines.append("> \n> What was said in those minutes is not in these notes.")
     return "\n".join(lines) + "\n\n" + notes
 
 
@@ -512,12 +552,20 @@ def transcribe_and_summarize(
     speaker_events: list[dict] | None = None,
     participant_names: list[str] | None = None,
     heartbeat_fn=None,
+    call_date: str | None = None,
 ) -> str:
     """Transcribe audio via chunked pipeline: split → transcribe segments → synthesize notes.
 
     ``heartbeat_fn`` is called between chunks. Transcribing a long call takes
     many minutes on the single-threaded poll loop, and without it the
     container's healthcheck goes stale during normal operation.
+
+    ``call_date`` (ISO ``YYYY-MM-DD``) dates the notes, the email subject and
+    the prompt. It defaults to today, which is right for a live call and
+    wrong for a retained one retried days later - pass the call's date.
+
+    Raises UpstreamUnavailable if Gemini stays down through a whole retry
+    budget; the caller keeps the recording for a later attempt.
     """
     client = genai.Client(api_key=api_key)
 
@@ -528,7 +576,7 @@ def transcribe_and_summarize(
             except Exception:
                 log.debug("Heartbeat callback failed", exc_info=True)
 
-    today = date.today().isoformat()
+    call_date = call_date or date.today().isoformat()
 
     # Get duration
     duration = _get_audio_duration(audio_path)
@@ -541,7 +589,7 @@ def transcribe_and_summarize(
             client,
             audio_path,
             conversation_name,
-            today,
+            call_date,
             duration,
             model=model,
             speaker_events=speaker_events,
@@ -581,7 +629,7 @@ def transcribe_and_summarize(
                     start,
                     end,
                     conversation_name,
-                    today,
+                    call_date,
                     model=model,
                     speaker_events=speaker_events,
                     participant_names=participant_names,
@@ -611,7 +659,7 @@ def transcribe_and_summarize(
                         start,
                         end,
                         conversation_name,
-                        today,
+                        call_date,
                         model=model,
                         speaker_events=speaker_events,
                         participant_names=participant_names,
@@ -641,7 +689,7 @@ def transcribe_and_summarize(
                             start,
                             end,
                             conversation_name,
-                            today,
+                            call_date,
                             model=FALLBACK_MODEL,
                             speaker_events=speaker_events,
                             participant_names=participant_names,
@@ -660,6 +708,11 @@ def transcribe_and_summarize(
                                 chars_per_min,
                             )
 
+            except UpstreamUnavailable:
+                # Not this segment's fault: Gemini is gone. Notes made now
+                # would have a hole the recording could have filled, and
+                # the caller deletes the recording once notes exist.
+                raise
             except Exception as exc:
                 log.error(
                     "Segment %d/%d could not be transcribed (%s). "
@@ -689,7 +742,7 @@ def transcribe_and_summarize(
 
         synthesis_prompt = SYNTHESIS_PROMPT.format(
             conversation_name=conversation_name,
-            date=today,
+            date=call_date,
             duration_min=int(duration / 60),
             segments=all_segments,
             timeline_block=_format_timeline_block(speaker_events),
@@ -723,7 +776,7 @@ def _single_pass_transcribe(
     client: genai.Client,
     audio_path: str,
     conversation_name: str,
-    today: str,
+    call_date: str,
     duration: float,
     model: str = "gemini-2.5-flash-lite",
     speaker_events: list[dict] | None = None,
@@ -756,7 +809,7 @@ def _single_pass_transcribe(
 
         prompt = SYNTHESIS_PROMPT.format(
             conversation_name=conversation_name,
-            date=today,
+            date=call_date,
             duration_min=int(duration / 60),
             segments="[Single recording — no segmentation needed. Transcribe and produce notes directly from the audio.]",
             timeline_block=_format_timeline_block(speaker_events),

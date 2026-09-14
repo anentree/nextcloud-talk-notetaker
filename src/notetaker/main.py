@@ -263,16 +263,25 @@ def _finish_recording(
     # heartbeat fresh so the container doesn't report unhealthy while it is
     # doing exactly what it is supposed to do.
     _touch_heartbeat(cfg)
-    participant_names = [p["display_name"] for p in participants]
-    notes = transcribe_and_summarize(
-        cfg.gemini_api_key,
-        audio_path,
-        name,
-        model=cfg.gemini_model,
-        speaker_events=speaker_events,
-        participant_names=participant_names,
-        heartbeat_fn=lambda: _touch_heartbeat(cfg),
-    )
+    notes = meta.get("notes")
+    if notes:
+        # A retry: the transcript survived in the sidecar. Doing it again
+        # would spend Gemini quota to produce different text.
+        log.info("Reusing the notes from an earlier attempt for room %s", token)
+    else:
+        participant_names = [p["display_name"] for p in participants]
+        notes = transcribe_and_summarize(
+            cfg.gemini_api_key,
+            audio_path,
+            name,
+            model=cfg.gemini_model,
+            speaker_events=speaker_events,
+            participant_names=participant_names,
+            heartbeat_fn=lambda: _touch_heartbeat(cfg),
+            # A retry runs days later; the notes are dated by the call.
+            call_date=call_start.date().isoformat(),
+        )
+        meta["notes"] = notes
     _touch_heartbeat(cfg)
 
     # 5. Save notes
@@ -303,7 +312,18 @@ def _finish_recording(
         log.exception("Failed to save notes for room %s", token)
 
     # 6. Email participants (retried, then spooled — never dropped)
-    if participants:
+    if not cfg.email_enabled:
+        log.info(
+            "Email is disabled (SMTP_HOST unset); not emailing notes for room %s",
+            token,
+        )
+        delivered = False
+    elif meta.get("email_done"):
+        # A retry after the email already went out (or was spooled, which
+        # retries itself). Sending again would mail everyone a duplicate.
+        log.info("Email for room %s was already handled by an earlier attempt", token)
+        delivered = True
+    elif participants:
         subject, body = extract_follow_up_email(notes)
         delivered = deliver_notes(
             cfg,
@@ -317,6 +337,9 @@ def _finish_recording(
                 "filename": filename,
             },
         )
+        # True or False, the email is now either sent or in the spool;
+        # either way a retry of this recording must not send it again.
+        meta["email_done"] = True
     else:
         log.warning("No participants with email found for room %s", token)
         delivered = False
@@ -366,12 +389,17 @@ def _retain_audio(cfg: Config, audio_path: str, meta: dict) -> None:
 
 def _retry_recording(cfg: Config, meta: dict, audio_path: str) -> bool:
     """Finish a retained recording. Recipients were normally resolved during
-    the live call; if that step itself failed (Nextcloud down), do it now."""
+    the live call; if that step itself failed (Nextcloud down), do it now.
+
+    get_participant_emails() answers [] on failure rather than raising, so
+    an empty list with attendees on record is a failed lookup, not "nobody
+    to email". Only an empty list with no attendees is a real answer."""
     participants = meta.get("participants")
-    if participants is None:
+    if participants is None or (not participants and meta.get("attendee_ids")):
         participants = _resolve_participants(
             cfg, meta["token"], set(meta.get("attendee_ids") or ())
         )
+        meta["participants"] = participants
     return _finish_recording(cfg, meta, audio_path, participants)
 
 
@@ -472,7 +500,10 @@ def main() -> None:
 
     log.info("Notetaker started. Polling every %ds...", cfg.poll_interval)
     log.info("Email overrides: %s", cfg.email_overrides)
-    log.info("SMTP: %s:%d, from=%s", cfg.smtp_host, cfg.smtp_port, cfg.smtp_from)
+    if cfg.email_enabled:
+        log.info("SMTP: %s:%d, from=%s", cfg.smtp_host, cfg.smtp_port, cfg.smtp_from)
+    else:
+        log.info("Email disabled: SMTP_HOST is unset, notes will only be stored")
 
     poll_tick = 0
     while not shutdown:
