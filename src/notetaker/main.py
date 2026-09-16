@@ -466,6 +466,13 @@ def _touch_heartbeat(cfg: Config) -> None:
 
 
 def main() -> None:
+    # `notetaker download-model` runs before any other setting is read: the
+    # wizard calls it after writing .env and before the container starts.
+    if sys.argv[1:] == ["download-model"]:
+        from notetaker.whisper import download_from_env
+
+        sys.exit(download_from_env())
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
