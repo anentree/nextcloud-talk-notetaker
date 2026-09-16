@@ -62,7 +62,7 @@ cat << 'BANNER'
 
   Nextcloud Talk AI Notetaker — Setup Wizard
 
-  Press Enter to accept the answer shown in [brackets].
+  Press Enter to accept the answer shown in [brackets] (for yes/no questions, the capital letter).
 
 BANNER
 printf "${NC}"
@@ -239,13 +239,14 @@ After each call, the recording is first turned into written text (this is
 called transcription). Gemini then turns that text into meeting notes.
 Choose who does the transcription:
 
-  A) Whisper — runs on this computer. Free, no daily limit, and the
-     recording never leaves your server. Needs a fairly fast computer and
-     a one-time 1.6 GB download (done for you at the end of this setup).
-     Notes arrive 30-60 minutes after a one-hour call, depending on the CPU.
-  B) Gemini — the recording is sent to Google, which turns it into text.
-     Works on any computer, but Google's free plan covers about 3 one-hour
-     calls a day, and notes can be delayed when Google is busy.
+  Whisper — runs on this computer. Free, no daily limit, and the
+    recording never leaves your server. Needs a fairly fast computer and
+    a one-time 1.6 GB download (done for you at the end of this setup).
+    Notes arrive 45-60 minutes after a one-hour call, depending on the CPU;
+    the bot cannot record another call until it is done.
+  Gemini — the recording is sent to Google, which turns it into text.
+    Works on any computer, but Google's free plan covers about 3 one-hour
+    calls a day, and notes can be delayed when Google is busy.
 
 You can change this later (see README, "Transcription").
 
@@ -608,7 +609,7 @@ echo
 if [ "$TRANSCRIPTION_BACKEND" = "whisper" ]; then
     $COMPOSE_CMD build
     echo
-    info "Downloading the Whisper model (1.6 GB, one time). This takes a few minutes depending on your internet speed; progress is printed every few seconds..."
+    info "Downloading the Whisper model, the 1.6 GB file from Step 3 (one time). This takes a few minutes depending on your internet speed; progress is printed every few seconds..."
     trap download_failed INT
     if ! $COMPOSE_CMD run --rm --no-deps notetaker download-model; then
         download_failed
