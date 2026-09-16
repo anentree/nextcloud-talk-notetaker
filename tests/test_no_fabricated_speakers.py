@@ -63,3 +63,18 @@ def test_segment_prompt_keeps_generic_labels_when_unsure():
 
 def test_segment_prompt_does_not_match_speaker_count_to_roster():
     assert "Do NOT try to match the length of the participant list" in SEGMENT_PROMPT
+
+
+def test_transcript_prompt_forbids_attributing_to_absent_people():
+    from notetaker.transcriber import TRANSCRIPT_SYNTHESIS_PROMPT
+
+    lowered = TRANSCRIPT_SYNTHESIS_PROMPT.lower()
+    assert "never attribute" in lowered
+    assert "roster is not evidence" in lowered
+
+
+def test_transcript_prompt_offers_an_unattributed_escape_hatch():
+    from notetaker.transcriber import TRANSCRIPT_SYNTHESIS_PROMPT
+
+    assert "Unattributed" in TRANSCRIPT_SYNTHESIS_PROMPT
+    assert "authoritative" in TRANSCRIPT_SYNTHESIS_PROMPT

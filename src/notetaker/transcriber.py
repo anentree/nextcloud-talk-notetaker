@@ -11,6 +11,10 @@ from datetime import date
 from google import genai
 from google.genai import types
 
+from notetaker.attribution import label_transcript
+from notetaker.whisper import WhisperFailed
+from notetaker.whisper import transcribe as whisper_transcribe
+
 log = logging.getLogger(__name__)
 
 # Retry budget for one Gemini call. On 2026-09-08 the API answered 503 "high
@@ -38,6 +42,16 @@ FALLBACK_MODEL = "gemini-2.5-flash"  # stronger model for retries
 # 19350 chars — climbing toward the cap — and the next one came back with no
 # text part at all. Give a segment the same budget the synthesis step gets.
 SEGMENT_MAX_OUTPUT_TOKENS = 16384
+
+# Whisper failures on one recording before that recording goes to Gemini
+# audio instead. Two clean failures (the live attempt and the first retry)
+# or, via retained.drain()'s pre-written `attempts`, three attempts that
+# died without recording anything (attempts > WHISPER_MAX_FAILURES). Assumes nothing before make_notes raises on
+# the retry path, which is true today (get_participant_emails returns []).
+WHISPER_MAX_FAILURES = 2
+# Stored in meta["transcript"] when Whisper finds no speech, so a retry
+# never re-runs a 20-minute transcription to learn the same thing.
+NO_SPEECH_SENTINEL = "[NO SPEECH DETECTED]"
 
 
 class EmptyGeminiResponse(RuntimeError):
@@ -89,20 +103,7 @@ Produce a detailed transcript of this segment in this format:
 [Detailed chronological transcript with speaker attribution. Include all discussion points, decisions, action items, and notable statements. Use direct quotes for important statements.]
 """
 
-SYNTHESIS_PROMPT = """You are a professional meeting note-taker. Below are detailed transcripts from all segments of a {duration_min}-minute Nextcloud Talk call named "{conversation_name}" on {date}.
-{participants_block}{timeline_block}
-Your job is to synthesize these segment transcripts into comprehensive, well-structured meeting notes.
-
-CRITICAL RULES:
-- Use ONLY information from the transcripts below. Do NOT invent or add anything not present.
-- Cover the ENTIRE call chronologically — every topic, decision, and action item.
-- Use speaker names from the SPEAKER TIMELINE. If the timeline has generic labels (Speaker 1, etc.), keep those generic labels unless the transcripts show the person being addressed by name.
-- NEVER attribute a statement or an action item to someone who does not appear in the segment transcripts. Attributing words to a person who was not on the call is the single worst error you can make here — it puts commitments in the mouths of people who never spoke.
-- The Participants line and every attribution must list ONLY people evidenced in the transcripts. The roster is not evidence. If only two people spoke, name two people, even if the roster lists more.
-- If you cannot tell who said something, write "Unattributed" rather than guessing a name.
-- If the transcripts mention specific numbers, dates, names, or amounts — use them exactly.
-
-Produce the notes in this markdown format:
+NOTES_FORMAT_BLOCK = """Produce the notes in this markdown format:
 
 # Meeting Notes: {conversation_name}
 **Date:** {date}
@@ -161,11 +162,52 @@ AI Notetaker
 ---
 
 Be thorough — this is the official record of the meeting. Every topic discussed should appear in the notes.
+"""
 
+SYNTHESIS_PROMPT = (
+    """You are a professional meeting note-taker. Below are detailed transcripts from all segments of a {duration_min}-minute Nextcloud Talk call named "{conversation_name}" on {date}.
+{participants_block}{timeline_block}
+Your job is to synthesize these segment transcripts into comprehensive, well-structured meeting notes.
+
+CRITICAL RULES:
+- Use ONLY information from the transcripts below. Do NOT invent or add anything not present.
+- Cover the ENTIRE call chronologically — every topic, decision, and action item.
+- Use speaker names from the SPEAKER TIMELINE. If the timeline has generic labels (Speaker 1, etc.), keep those generic labels unless the transcripts show the person being addressed by name.
+- NEVER attribute a statement or an action item to someone who does not appear in the segment transcripts. Attributing words to a person who was not on the call is the single worst error you can make here — it puts commitments in the mouths of people who never spoke.
+- The Participants line and every attribution must list ONLY people evidenced in the transcripts. The roster is not evidence. If only two people spoke, name two people, even if the roster lists more.
+- If you cannot tell who said something, write "Unattributed" rather than guessing a name.
+- If the transcripts mention specific numbers, dates, names, or amounts — use them exactly.
+
+"""
+    + NOTES_FORMAT_BLOCK
+    + """
 === SEGMENT TRANSCRIPTS ===
 
 {segments}
 """
+)
+
+TRANSCRIPT_SYNTHESIS_PROMPT = (
+    """You are a professional meeting note-taker. Below is a transcript of a {duration_min}-minute Nextcloud Talk call named "{conversation_name}" on {date}, produced by speech recognition.
+{participants_block}
+Each transcript line is "[MM:SS] Speaker: words". The speaker labels come from the call's separate audio tracks and are authoritative: the name on a line is the person who said those words. "Unattributed" means the speaker is unknown; "A + B" means two people were talking at once. Lines with no speaker label mean no attribution was possible for this call.
+
+CRITICAL RULES:
+- Use ONLY information from the transcript below. Do NOT invent or add anything not present.
+- Cover the ENTIRE call chronologically — every topic, decision, and action item.
+- NEVER attribute a statement or an action item to someone who does not appear as a speaker label in the transcript. The roster is not evidence of attendance or of speech.
+- If the speaker of a statement is "Unattributed" or missing, write "Unattributed" rather than guessing a name.
+- Speech recognition mishears names. If a misheard name clearly matches a spelling in the POSSIBLE PARTICIPANTS list, use that spelling; introduce nothing else from that list.
+- If the transcript mentions specific numbers, dates, names, or amounts — use them exactly.
+
+"""
+    + NOTES_FORMAT_BLOCK
+    + """
+=== TRANSCRIPT ===
+
+{transcript}
+"""
+)
 
 
 def _format_participants_block(names: list[str] | None) -> str:
@@ -542,6 +584,125 @@ def _prepend_coverage_warning(
     # same input) would fail the same way again.
     lines.append("> \n> What was said in those minutes is not in these notes.")
     return "\n".join(lines) + "\n\n" + notes
+
+
+def summarize_transcript(
+    api_key: str,
+    transcript: str,
+    conversation_name: str,
+    call_date: str,
+    duration_min: int,
+    participant_names: list[str] | None = None,
+    model: str = "gemini-2.5-flash-lite",
+    heartbeat_fn=None,
+) -> str:
+    """One text-only Gemini call: an already-attributed transcript → notes."""
+    client = genai.Client(api_key=api_key)
+    prompt = TRANSCRIPT_SYNTHESIS_PROMPT.format(
+        conversation_name=conversation_name,
+        date=call_date,
+        duration_min=int(duration_min),
+        participants_block=_format_participants_block(participant_names),
+        transcript=transcript,
+    )
+    log.info("Synthesizing notes from a %d-char transcript", len(transcript))
+    notes = _gemini_call(
+        client, [prompt], max_output_tokens=16384, model=model, heartbeat_fn=heartbeat_fn
+    )
+    log.info("Final notes: %d chars", len(notes))
+    return notes
+
+
+def _no_speech_notes(conversation_name: str, call_date: str, duration_min: int) -> str:
+    return (
+        f"# Meeting Notes: {conversation_name}\n"
+        f"**Date:** {call_date}\n"
+        f"**Duration:** ~{int(duration_min)} minutes\n\n"
+        "No speech was detected in this recording, so there are no notes.\n"
+    )
+
+
+def make_notes(
+    cfg,
+    meta: dict,
+    audio_path: str,
+    conversation_name: str,
+    call_date: str | None,
+    participant_names: list[str] | None = None,
+    heartbeat_fn=None,
+) -> str:
+    """Produce notes for one recording by the configured backend.
+
+    ``meta`` is the mutable bookkeeping the caller persists with a retained
+    recording: ``speaker_events`` in, ``transcript`` / ``whisper_failures``
+    out, ``attempts`` from retained.drain(). Raises WhisperFailed or
+    UpstreamUnavailable; the caller retains the recording either way.
+    """
+    speaker_events = meta.get("speaker_events") or []
+    if cfg.transcription_backend != "whisper":
+        return transcribe_and_summarize(
+            cfg.gemini_api_key,
+            audio_path,
+            conversation_name,
+            model=cfg.gemini_model,
+            speaker_events=speaker_events,
+            participant_names=participant_names,
+            heartbeat_fn=heartbeat_fn,
+            call_date=call_date,
+        )
+
+    call_date = call_date or date.today().isoformat()
+    duration_min = int(_get_audio_duration(audio_path) / 60)
+    transcript = meta.get("transcript")
+    if transcript is None:
+        failures = int(meta.get("whisper_failures", 0))
+        attempts = int(meta.get("attempts", 0))
+        if failures >= WHISPER_MAX_FAILURES or attempts > WHISPER_MAX_FAILURES:
+            log.warning(
+                "Whisper failed %d time(s) over %d attempt(s) on this recording; "
+                "using Gemini audio transcription for it instead",
+                failures,
+                attempts,
+            )
+            return transcribe_and_summarize(
+                cfg.gemini_api_key,
+                audio_path,
+                conversation_name,
+                model=cfg.gemini_model,
+                speaker_events=speaker_events,
+                participant_names=participant_names,
+                heartbeat_fn=heartbeat_fn,
+                call_date=call_date,
+            )
+        try:
+            segments = whisper_transcribe(
+                audio_path,
+                model_name=cfg.whisper_model,
+                model_dir=cfg.whisper_model_dir,
+                language=cfg.whisper_language,
+                heartbeat_fn=heartbeat_fn,
+            )
+        except WhisperFailed:
+            meta["whisper_failures"] = failures + 1
+            raise
+        transcript = label_transcript(segments, speaker_events) or NO_SPEECH_SENTINEL
+        meta["transcript"] = transcript
+        log.info("Whisper transcript: %d chars", len(transcript))
+
+    if transcript == NO_SPEECH_SENTINEL:
+        log.warning("No speech detected in %s; writing placeholder notes", audio_path)
+        return _no_speech_notes(conversation_name, call_date, duration_min)
+
+    return summarize_transcript(
+        cfg.gemini_api_key,
+        transcript,
+        conversation_name,
+        call_date,
+        duration_min=duration_min,
+        participant_names=participant_names,
+        model=cfg.gemini_model,
+        heartbeat_fn=heartbeat_fn,
+    )
 
 
 def transcribe_and_summarize(
