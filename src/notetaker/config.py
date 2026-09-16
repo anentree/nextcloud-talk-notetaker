@@ -35,6 +35,15 @@ class Config:
     gemini_api_key: str
     auth_method: str = "nextcloud"
     gemini_model: str = "gemini-2.5-flash-lite"
+    # "gemini" sends the audio to Google (six requests per hour-long call on
+    # the chunked path); "whisper" transcribes locally and sends Gemini one
+    # text request. Gemini always writes the notes, so the key stays required.
+    transcription_backend: str = "gemini"
+    whisper_model: str = "large-v3-turbo"
+    whisper_model_dir: str = "/data/models"
+    # Two-letter code; empty means auto-detect (decided from the first 30 s
+    # of speech, which a noisy opening can get wrong for the whole hour).
+    whisper_language: str = "en"
     filename_last_user: str = ""
     notes_storage: str = "nextcloud"
     local_notes_dir: str = ""
@@ -98,6 +107,11 @@ class Config:
             problems.append(
                 f"AUTH_METHOD must be 'nextcloud' or 'yunohost' (got {self.auth_method!r})"
             )
+        if self.transcription_backend not in ("gemini", "whisper"):
+            problems.append(
+                "TRANSCRIPTION_BACKEND must be 'gemini' or 'whisper' "
+                f"(got {self.transcription_backend!r})"
+            )
         if self.poll_interval < 1:
             problems.append("POLL_INTERVAL_SECONDS must be >= 1")
         return problems
@@ -150,6 +164,13 @@ class Config:
             gemini_api_key=os.environ["GEMINI_API_KEY"],
             auth_method=os.getenv("AUTH_METHOD", "nextcloud"),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+            transcription_backend=os.getenv("TRANSCRIPTION_BACKEND", "gemini")
+            .strip()
+            .lower(),
+            whisper_model=os.getenv("WHISPER_MODEL", "large-v3-turbo").strip()
+            or "large-v3-turbo",
+            whisper_model_dir=os.getenv("WHISPER_MODEL_DIR", "/data/models"),
+            whisper_language=os.getenv("WHISPER_LANGUAGE", "en").strip(),
             filename_last_user=os.getenv("FILENAME_LAST_USER", ""),
             notes_storage=os.getenv("NOTES_STORAGE", "nextcloud"),
             local_notes_dir=os.getenv("LOCAL_NOTES_DIR", ""),

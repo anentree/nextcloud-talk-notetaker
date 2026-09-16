@@ -65,3 +65,51 @@ def test_direct_construction_keeps_email_on():
         gemini_api_key="gemini-key",
     )
     assert cfg.email_enabled is True
+
+
+def test_transcription_settings_default_to_gemini(monkeypatch):
+    for k, v in {
+        "NEXTCLOUD_URL": "https://nc.example.com",
+        "NEXTCLOUD_USER": "bot",
+        "NEXTCLOUD_PASSWORD": "pw",
+        "GEMINI_API_KEY": "key",
+    }.items():
+        monkeypatch.setenv(k, v)
+    cfg = Config.from_env()
+    assert cfg.transcription_backend == "gemini"
+    assert cfg.whisper_model == "large-v3-turbo"
+    assert cfg.whisper_model_dir == "/data/models"
+    assert cfg.whisper_language == "en"
+    assert cfg.validate() == []
+
+
+def test_transcription_settings_are_read_and_normalised(monkeypatch):
+    for k, v in {
+        "NEXTCLOUD_URL": "https://nc.example.com",
+        "NEXTCLOUD_USER": "bot",
+        "NEXTCLOUD_PASSWORD": "pw",
+        "GEMINI_API_KEY": "key",
+        "TRANSCRIPTION_BACKEND": " Whisper ",
+        "WHISPER_MODEL": "medium",
+        "WHISPER_MODEL_DIR": "/models",
+        "WHISPER_LANGUAGE": "",
+    }.items():
+        monkeypatch.setenv(k, v)
+    cfg = Config.from_env()
+    assert cfg.transcription_backend == "whisper"
+    assert cfg.whisper_model == "medium"
+    assert cfg.whisper_model_dir == "/models"
+    assert cfg.whisper_language == ""
+
+
+def test_unknown_transcription_backend_is_a_config_problem():
+    cfg = Config(
+        nextcloud_url="https://nc.example.com",
+        nextcloud_user="bot",
+        nextcloud_password="pw",
+        nextcloud_web_password="pw",
+        gemini_api_key="key",
+        transcription_backend="deepgram",
+    )
+    problems = cfg.validate()
+    assert any("TRANSCRIPTION_BACKEND" in p and "deepgram" in p for p in problems)

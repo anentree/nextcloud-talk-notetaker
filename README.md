@@ -82,7 +82,11 @@ All configuration is via environment variables in `.env`:
 | `NEXTCLOUD_WEB_PASSWORD`      | No       | same as PASSWORD           | Separate browser login password (Yunohost SSO)                                 |
 | `GEMINI_API_KEY`              | Yes      | —                          | Google Gemini API key                                                          |
 | `AUTH_METHOD`                 | No       | `nextcloud`                | `nextcloud` (standard login) or `yunohost` (SSO)                               |
-| `GEMINI_MODEL`                | No       | `gemini-2.5-flash-lite`    | Gemini model for transcription                                                 |
+| `GEMINI_MODEL`                | No       | `gemini-2.5-flash-lite`    | Gemini model for the notes (and transcription when the backend is gemini)      |
+| `TRANSCRIPTION_BACKEND`       | No       | `gemini`                   | `whisper` (local, private, needs model download) or `gemini` (Google hears)    |
+| `WHISPER_MODEL`               | No       | `large-v3-turbo`           | faster-whisper model name; `medium`/`small` are faster and less accurate       |
+| `WHISPER_LANGUAGE`            | No       | `en`                       | Two-letter language code for Whisper; empty = auto-detect                      |
+| `WHISPER_MODEL_DIR`           | No       | `/data/models`             | Model files inside the container (`./models` on the host)                      |
 | `NOTES_STORAGE`               | No       | `nextcloud`                | `nextcloud` (WebDAV) or `local` (filesystem)                                   |
 | `NOTES_FOLDER`                | No       | `/Talk/Notes`              | Nextcloud folder for notes (the wizard sets `/meeting-notes`)                  |
 | `LOCAL_NOTES_DIR`             | No       | —                          | Local directory for notes (when storage=local)                                 |

@@ -403,9 +403,20 @@ ${WEB_PASS_PREFIX}NEXTCLOUD_WEB_PASSWORD=$NC_WEB_PASS
 # Authentication method: "nextcloud" (standard) or "yunohost" (SSO)
 AUTH_METHOD=$AUTH_METHOD
 
-# Gemini AI
+# Transcription: "whisper" (runs on this machine, private) or "gemini" (Google hears the audio).
+# See README, "Transcription", before changing this: switching to Whisper needs the model download first.
+TRANSCRIPTION_BACKEND=gemini
+# Whisper model (only when TRANSCRIPTION_BACKEND=whisper). large-v3-turbo is the default;
+# medium and small are faster and less accurate.
+WHISPER_MODEL=large-v3-turbo
+# Language of the calls as a two-letter code. Leave empty to auto-detect.
+WHISPER_LANGUAGE=en
+# Where the model files live INSIDE the container. docker-compose.yml mounts ./models here.
+WHISPER_MODEL_DIR=/data/models
+
+# Gemini AI (writes the notes; with TRANSCRIPTION_BACKEND=gemini it also transcribes the audio)
 GEMINI_API_KEY=$GEMINI_KEY
-# Model for transcription (default: gemini-2.5-flash-lite, cheapest option)
+# Gemini model for the notes (and for transcription when the backend is gemini)
 GEMINI_MODEL=gemini-2.5-flash-lite
 
 # Notes storage: "nextcloud" (upload via WebDAV) or "local" (save to filesystem)
