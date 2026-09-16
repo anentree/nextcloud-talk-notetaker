@@ -25,6 +25,8 @@ case "$1 $2" in
   "--version ")       echo "Docker version 27.0.0-stub"; exit 0 ;;
   "compose version")  exit 0 ;;
   "compose up")       echo "compose up $*" >> "$STUB_CALLS"; exit 0 ;;
+  "compose build")    echo "compose build $*" >> "$STUB_CALLS"; exit 0 ;;
+  "compose run")      echo "compose run $*" >> "$STUB_CALLS"; exit "${STUB_RUN_EXIT:-0}" ;;
   "compose ps")       [ "${STUB_PS_EXIT:-0}" = 0 ] && echo "stubcontainer123"; exit "${STUB_PS_EXIT:-0}" ;;
   "compose logs")     printf '%s\n' "$STUB_LOGS"; exit "${STUB_LOGS_EXIT:-0}" ;;
   "inspect --format") echo "$STUB_HEALTH"; exit 0 ;;
@@ -105,6 +107,14 @@ def run_setup(
         # Keep the health wait fast; setup.sh reads these overrides.
         "SETUP_HEALTH_POLL_INTERVAL": "0",
         "SETUP_HEALTH_TIMEOUT": "2",
+        # A strong x86_64 box, so the transcription default is stable
+        # regardless of the machine running the tests.
+        "SETUP_CPU_THREADS": "12",
+        "SETUP_MEM_GB": "31",
+        "SETUP_MEM_AVAIL_GB": "19",
+        "SETUP_DISK_GB": "220",
+        "SETUP_ARCH": "x86_64",
+        "SETUP_AVX2": "1",
     }
     env.update(env_overrides or {})
     return subprocess.run(
@@ -141,6 +151,7 @@ def answers(
     smtp_from="notes@example.com",
     smtp_auth="n",
     overrides="n",
+    transcription="n",
 ) -> list[str]:
     a = [
         "y",  # bot user created?
@@ -148,6 +159,7 @@ def answers(
         "ai-notetaker",  # bot username
         "s3cret",  # bot password
         "n",  # Yunohost SSO?
+        transcription,  # use Whisper?
         "AIza-test-key",  # Gemini key
         storage,  # A) Nextcloud  B) local
     ]
@@ -160,6 +172,113 @@ def answers(
             a += ["mailer", "mailpass"]
         a.append(overrides)
     return a
+
+
+WEAK = {"SETUP_CPU_THREADS": "2", "SETUP_MEM_GB": "4", "SETUP_MEM_AVAIL_GB": "1", "SETUP_DISK_GB": "3"}
+
+# prompt_yn wraps the question in bold: "...transcription?\x1b[0m [Y/n]: ".
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
+def docker_calls(tmp_path: Path) -> list[str]:
+    return (tmp_path / "docker-calls.log").read_text().splitlines()
+
+
+def test_strong_machine_defaults_to_whisper_and_downloads_before_starting(tmp_path):
+    result = run_setup(tmp_path, answers(transcription=""))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "This computer can run Whisper (recommended)" in result.stdout
+    assert "Use Whisper for transcription? [Y/n]" in plain(result.stdout)
+    assert "Whisper will transcribe on this computer" in result.stdout
+    env = read_env(tmp_path)
+    assert env["TRANSCRIPTION_BACKEND"] == "whisper"
+    assert env["NOTETAKER_MEMORY_LIMIT"] == "6g"
+    assert env["WHISPER_MODEL"] == "large-v3-turbo"
+    calls = docker_calls(tmp_path)
+    assert calls == [
+        "compose build compose build",
+        "compose run compose run --rm --no-deps notetaker download-model",
+        "compose up compose up -d",
+    ]
+    assert (tmp_path / "work" / "models").is_dir()
+    assert (tmp_path / "work" / "notes").is_dir()
+
+
+def test_weak_machine_names_every_shortfall_and_defaults_to_gemini(tmp_path):
+    result = run_setup(tmp_path, answers(transcription=""), env_overrides=WEAK)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 processor cores (Whisper needs 4)" in result.stdout
+    assert "4 GB memory (Whisper needs 8)" in result.stdout
+    assert "Gemini is recommended for this computer" in result.stdout
+    assert "Use Whisper for transcription? [y/N]" in plain(result.stdout)
+    env = read_env(tmp_path)
+    assert env["TRANSCRIPTION_BACKEND"] == "gemini"
+    assert env["NOTETAKER_MEMORY_LIMIT"] == "2g"
+    assert docker_calls(tmp_path) == ["compose up compose up -d --build"]
+    assert (tmp_path / "work" / "models").is_dir()
+    assert (tmp_path / "work" / "notes").is_dir()
+
+
+def test_arm_or_no_avx2_is_called_slow(tmp_path):
+    result = run_setup(tmp_path, answers(transcription=""), env_overrides={"SETUP_ARCH": "aarch64", "SETUP_AVX2": "0"})
+    assert "slow at this kind of work" in result.stdout
+    assert read_env(tmp_path)["TRANSCRIPTION_BACKEND"] == "gemini"
+
+
+def test_unmeasurable_hardware_is_safe_not_fatal(tmp_path):
+    result = run_setup(tmp_path, answers(transcription=""), env_overrides={"SETUP_CPU_THREADS": "", "SETUP_MEM_GB": ""})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "could not read the processor count" in result.stdout
+    assert "safe choice when the hardware is unknown" in result.stdout
+    assert read_env(tmp_path)["TRANSCRIPTION_BACKEND"] == "gemini"
+
+
+def test_explicit_answers_override_the_recommendation(tmp_path):
+    result = run_setup(tmp_path, answers(transcription="n"))
+    assert read_env(tmp_path)["TRANSCRIPTION_BACKEND"] == "gemini"
+    assert "Gemini will transcribe" in result.stdout
+
+    result = run_setup(tmp_path, answers(transcription="y"), env_overrides=WEAK)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert read_env(tmp_path)["TRANSCRIPTION_BACKEND"] == "whisper"
+    assert "Whisper may be slow or run out of memory here" in result.stdout
+
+
+def test_failed_download_tells_them_how_to_finish(tmp_path):
+    result = run_setup(tmp_path, answers(transcription="y"), env_overrides={"STUB_RUN_EXIT": "1"})
+    assert result.returncode == 1
+    assert "The Whisper model download did not finish" in result.stdout
+    assert "docker compose run --rm --no-deps notetaker download-model" in result.stdout
+    assert "docker compose up -d" in result.stdout
+    assert "TRANSCRIPTION_BACKEND=gemini" in result.stdout
+    assert read_env(tmp_path)["TRANSCRIPTION_BACKEND"] == "whisper", ".env must be kept"
+    assert "compose up" not in "\n".join(docker_calls(tmp_path))
+
+
+def test_gemini_step_explains_the_key_and_the_free_plan_by_backend(tmp_path):
+    whisper = run_setup(tmp_path, answers(transcription="y")).stdout
+    assert "a long\npassword" in whisper or "a long password" in whisper
+    assert "free plan is plenty" in whisper
+    assert "turn on billing" not in whisper
+
+    gemini = run_setup(tmp_path, answers(transcription="n")).stdout
+    assert "about 3 one-hour calls a day" in gemini
+    assert "turn on billing" in gemini
+
+
+def test_banner_explains_the_bracket_default(tmp_path):
+    assert "Press Enter to accept the answer shown in [brackets]" in run_setup(tmp_path, answers()).stdout
+
+
+def test_env_values_never_share_a_line_with_a_comment(tmp_path):
+    run_setup(tmp_path, answers(transcription="y"))
+    for line in (tmp_path / "work" / ".env").read_text().splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            assert "#" not in line.partition("=")[2], line
 
 
 def test_local_storage_writes_the_container_path_not_a_host_path(tmp_path):

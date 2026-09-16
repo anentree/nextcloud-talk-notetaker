@@ -62,6 +62,8 @@ cat << 'BANNER'
 
   Nextcloud Talk AI Notetaker — Setup Wizard
 
+  Press Enter to accept the answer shown in [brackets].
+
 BANNER
 printf "${NC}"
 
@@ -229,11 +231,118 @@ echo
 info "Tip: To generate notes for a call, add the bot user as a"
 info "participant in that Talk room before or during the call."
 
-# ─── Step 3: Gemini API Key ──────────────────────────────────────────────────
-header "Step 3: Gemini API Key"
+# ─── Step 3: Transcription ────────────────────────────────────────────────────
+header "Step 3: Transcription"
 
-echo "The notetaker uses Google's Gemini AI to transcribe and summarize calls."
-echo "Get a free API key at: https://aistudio.google.com/apikey"
+cat << 'EOF'
+After each call, the recording is first turned into written text (this is
+called transcription). Gemini then turns that text into meeting notes.
+Choose who does the transcription:
+
+  A) Whisper — runs on this computer. Free, no daily limit, and the
+     recording never leaves your server. Needs a fairly fast computer and
+     a one-time 1.6 GB download (done for you at the end of this setup).
+     Notes arrive 30-60 minutes after a one-hour call, depending on the CPU.
+  B) Gemini — the recording is sent to Google, which turns it into text.
+     Works on any computer, but Google's free plan covers about 3 one-hour
+     calls a day, and notes can be delayed when Google is busy.
+
+You can change this later (see README, "Transcription").
+
+EOF
+
+# Hardware probes. Each falls back to 0 ("could not read") instead of
+# aborting the wizard under set -e. The SETUP_* overrides exist for tests;
+# an empty override means "could not read".
+CPU_THREADS="${SETUP_CPU_THREADS-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)}"
+MEM_GB="${SETUP_MEM_GB-$(awk '/^MemTotal:/ {printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)}"
+MEM_AVAIL_GB="${SETUP_MEM_AVAIL_GB-$(awk '/^MemAvailable:/ {printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)}"
+DISK_GB="${SETUP_DISK_GB-$(df -Pk . 2>/dev/null | awk 'NR==2 {printf "%d", $4/1048576}' || echo 0)}"
+ARCH="${SETUP_ARCH-$(uname -m 2>/dev/null || echo unknown)}"
+# AVX2: 1 = present, 0 = absent, "" = could not read (no /proc/cpuinfo).
+if [ -n "${SETUP_AVX2+x}" ]; then
+    AVX2="$SETUP_AVX2"
+elif [ ! -r /proc/cpuinfo ]; then
+    AVX2=""
+elif grep -qw avx2 /proc/cpuinfo 2>/dev/null; then
+    AVX2=1
+else
+    AVX2=0
+fi
+# Anything that is not a whole number counts as unreadable.
+for v in CPU_THREADS MEM_GB MEM_AVAIL_GB DISK_GB; do
+    case "${!v}" in
+        ''|*[!0-9]*) printf -v "$v" '%s' 0 ;;
+    esac
+done
+
+describe_probe() { # value  unit-words  what-it-is
+    if [ "$1" -gt 0 ]; then printf '%s %s' "$1" "$2"; else printf 'could not read the %s' "$3"; fi
+}
+CHECK_LINE="$(describe_probe "$CPU_THREADS" "processor cores" "processor count")"
+CHECK_LINE="$CHECK_LINE, $(describe_probe "$MEM_GB" "GB memory" "memory")"
+[ "$MEM_GB" -gt 0 ] && [ "$MEM_AVAIL_GB" -gt 0 ] && CHECK_LINE="$CHECK_LINE ($MEM_AVAIL_GB GB free)"
+CHECK_LINE="$CHECK_LINE, $(describe_probe "$DISK_GB" "GB free disk" "free disk")"
+info "Checking this computer... $CHECK_LINE."
+
+REASONS=()
+UNKNOWN=""
+if [ "$CPU_THREADS" -le 0 ]; then UNKNOWN=1
+elif [ "$CPU_THREADS" -lt 4 ]; then REASONS+=("only $CPU_THREADS processor cores (Whisper needs 4)"); fi
+if [ "$MEM_GB" -le 0 ]; then UNKNOWN=1
+elif [ "$MEM_GB" -lt 8 ]; then REASONS+=("$MEM_GB GB memory (Whisper needs 8)"); fi
+if [ "$MEM_AVAIL_GB" -gt 0 ] && [ "$MEM_AVAIL_GB" -lt 4 ]; then
+    REASONS+=("only $MEM_AVAIL_GB GB memory free right now (Whisper needs 4)")
+fi
+if [ "$DISK_GB" -le 0 ]; then UNKNOWN=1
+elif [ "$DISK_GB" -lt 5 ]; then REASONS+=("$DISK_GB GB free disk (Whisper needs 5)"); fi
+if [ "$ARCH" = "unknown" ] || [ -z "$AVX2" ]; then UNKNOWN=1
+elif [ "$ARCH" != "x86_64" ] || [ "$AVX2" != "1" ]; then
+    REASONS+=("this CPU is slow at this kind of work (no AVX2 / ARM), so a 1-hour call could take hours")
+fi
+
+if [ "${#REASONS[@]}" -gt 0 ]; then
+    MSG="${REASONS[0]}"
+    for r in "${REASONS[@]:1}"; do MSG="$MSG and $r"; done
+    warn "${MSG^}. Gemini is recommended for this computer."
+    WHISPER_DEFAULT="n"
+elif [ -n "$UNKNOWN" ]; then
+    warn "Gemini is the safe choice when the hardware is unknown."
+    WHISPER_DEFAULT="n"
+else
+    success "This computer can run Whisper (recommended)."
+    WHISPER_DEFAULT="y"
+fi
+echo
+
+if prompt_yn "Use Whisper for transcription?" "$WHISPER_DEFAULT"; then
+    TRANSCRIPTION_BACKEND="whisper"
+    MEMORY_LIMIT="6g"
+    success "Whisper will transcribe on this computer."
+    if [ "$WHISPER_DEFAULT" = "n" ]; then
+        warn "Whisper may be slow or run out of memory here. If notes stop arriving, switch to Gemini (README, \"Transcription\")."
+    fi
+else
+    TRANSCRIPTION_BACKEND="gemini"
+    MEMORY_LIMIT="2g"
+    success "Gemini will transcribe."
+fi
+
+# ─── Step 4: Gemini API Key ──────────────────────────────────────────────────
+header "Step 4: Gemini API Key"
+
+cat << 'EOF'
+Gemini is Google's AI service. The notetaker needs an API key — a long
+password that lets it use Gemini through your Google account.
+Get a free one at: https://aistudio.google.com/apikey
+(Sign in, click "Create API key", copy it, paste it below. Typing is hidden.)
+EOF
+if [ "$TRANSCRIPTION_BACKEND" = "whisper" ]; then
+    echo "Gemini only writes the notes from text, so the free plan is plenty."
+else
+    echo "Gemini also transcribes the audio. The free plan covers about 3 one-hour calls a day."
+    echo "For more, turn on billing in Google AI Studio (about \$0.02 per one-hour call)."
+fi
 echo
 
 GEMINI_KEY=$(prompt_secret "Enter your Gemini API key")
@@ -256,8 +365,8 @@ case "$GEMINI_RESP" in
         warn "Unexpected response ($GEMINI_RESP) from Gemini API. Continuing anyway." ;;
 esac
 
-# ─── Step 4: Notes Storage ────────────────────────────────────────────────────
-header "Step 4: Notes Storage"
+# ─── Step 5: Notes Storage ────────────────────────────────────────────────────
+header "Step 5: Notes Storage"
 
 echo "Where should meeting notes be saved?"
 echo
@@ -319,8 +428,8 @@ else
     esac
 fi
 
-# ─── Step 5: Email (optional) ────────────────────────────────────────────────
-header "Step 5: Email Notifications (optional)"
+# ─── Step 6: Email (optional) ────────────────────────────────────────────────
+header "Step 6: Email Notifications (optional)"
 
 SMTP_HOST=""
 SMTP_PORT=""
@@ -363,8 +472,8 @@ else
     info "Email notifications disabled. Notes will still be saved."
 fi
 
-# ─── Step 6: Generate .env and start ─────────────────────────────────────────
-header "Step 6: Starting the Notetaker"
+# ─── Step 7: Generate .env and start ─────────────────────────────────────────
+header "Step 7: Starting the Notetaker"
 
 if [ -f .env ]; then
     ENV_BACKUP=".env.bak.$(date +%Y%m%d-%H%M%S)"
@@ -405,7 +514,7 @@ AUTH_METHOD=$AUTH_METHOD
 
 # Transcription: "whisper" (runs on this machine, private) or "gemini" (Google hears the audio).
 # See README, "Transcription", before changing this: switching to Whisper needs the model download first.
-TRANSCRIPTION_BACKEND=gemini
+TRANSCRIPTION_BACKEND=$TRANSCRIPTION_BACKEND
 # Whisper model (only when TRANSCRIPTION_BACKEND=whisper). large-v3-turbo is the default;
 # small is about twice as fast and less accurate.
 WHISPER_MODEL=large-v3-turbo
@@ -414,7 +523,7 @@ WHISPER_LANGUAGE=en
 # Where the model files live INSIDE the container. docker-compose.yml mounts ./models here.
 WHISPER_MODEL_DIR=/data/models
 # Memory cap for the container. Whisper needs 6g; Gemini-only installs keep 2g.
-NOTETAKER_MEMORY_LIMIT=2g
+NOTETAKER_MEMORY_LIMIT=$MEMORY_LIMIT
 
 # Gemini AI (writes the notes; with TRANSCRIPTION_BACKEND=gemini it also transcribes the audio)
 GEMINI_API_KEY=$GEMINI_KEY
@@ -478,9 +587,38 @@ umask 022
 
 success ".env file created (mode 600)."
 
-info "Building and starting the notetaker..."
+# Both directories are bind mounts; create them as the current user so
+# Docker does not create them root-owned in the checkout.
+mkdir -p ./models ./notes
+
+download_failed() {
+    trap - INT
+    echo
+    error "The Whisper model download did not finish."
+    info "Your settings are saved in .env. To finish, run these two commands:"
+    echo "          $COMPOSE_CMD run --rm --no-deps notetaker download-model"
+    echo "          $COMPOSE_CMD up -d"
+    info "The download resumes where it stopped. To use Gemini instead: set"
+    echo "        TRANSCRIPTION_BACKEND=gemini in .env, then run: $COMPOSE_CMD up -d"
+    exit 1
+}
+
+info "Building the notetaker (a few minutes the first time)..."
 echo
-$COMPOSE_CMD up -d --build
+if [ "$TRANSCRIPTION_BACKEND" = "whisper" ]; then
+    $COMPOSE_CMD build
+    echo
+    info "Downloading the Whisper model (1.6 GB, one time). This takes a few minutes depending on your internet speed; progress is printed every few seconds..."
+    trap download_failed INT
+    if ! $COMPOSE_CMD run --rm --no-deps notetaker download-model; then
+        download_failed
+    fi
+    trap - INT
+    echo
+    $COMPOSE_CMD up -d
+else
+    $COMPOSE_CMD up -d --build
+fi
 
 # The app checks every dependency at startup and refuses to run if one
 # fails; the container then restarts in a loop. Wait for the healthcheck
@@ -545,6 +683,7 @@ echo "  3. Make the bot a 'subadmin' of user groups for email lookup (see README
 echo
 info "Useful commands:"
 echo "  $COMPOSE_CMD logs -f        # View logs"
+echo "  $COMPOSE_CMD up -d           # Apply .env changes (restart is not enough)"
 echo "  $COMPOSE_CMD restart        # Restart"
 echo "  $COMPOSE_CMD down           # Stop"
 echo "  ./setup.sh                  # Re-configure"
