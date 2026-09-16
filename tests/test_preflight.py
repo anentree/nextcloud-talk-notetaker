@@ -8,7 +8,9 @@ configuration, or it turns a silent bug into a crash-loop.
 
 from __future__ import annotations
 
+import contextlib
 import ssl
+import sys
 from unittest.mock import MagicMock, patch
 
 from notetaker.config import Config
@@ -248,3 +250,73 @@ def test_preflight_still_checks_smtp_when_email_is_enabled(tmp_path):
     ):
         run_preflight(cfg)
     smtp.assert_called_once()
+
+
+# --- whisper ---------------------------------------------------------------
+
+
+def _whisper_cfg(tmp_path, **kw):
+    return make_cfg(state_dir=str(tmp_path), transcription_backend="whisper", **kw)
+
+
+@contextlib.contextmanager
+def other_checks_ok(monkeypatch):
+    """Every non-whisper check passes, and the faster_whisper package is
+    present (a stub module), so these tests do not depend on the dev venv."""
+    monkeypatch.setitem(sys.modules, "faster_whisper", MagicMock())
+    with (
+        patch("notetaker.preflight.check_smtp"),
+        patch("notetaker.preflight.check_nextcloud"),
+        patch("notetaker.preflight.check_notes_target"),
+        patch("notetaker.preflight.check_gemini"),
+    ):
+        yield
+
+
+def test_whisper_check_is_skipped_for_the_gemini_backend(tmp_path, monkeypatch):
+    cfg = make_cfg(state_dir=str(tmp_path))
+    with (
+        other_checks_ok(monkeypatch),
+        patch("notetaker.preflight.check_whisper", side_effect=AssertionError("must not run")),
+    ):
+        assert run_preflight(cfg) == []
+
+
+def test_missing_model_names_the_download_command_and_the_alternative(tmp_path, monkeypatch):
+    cfg = _whisper_cfg(tmp_path)
+    with (
+        other_checks_ok(monkeypatch),
+        patch("notetaker.whisper.model_is_downloaded", return_value=False),
+    ):
+        failures = run_preflight(cfg)
+    assert len(failures) == 1 and failures[0].startswith("whisper:")
+    assert "docker compose run --rm --no-deps notetaker download-model" in failures[0]
+    assert "TRANSCRIPTION_BACKEND=gemini" in failures[0]
+    assert "large-v3-turbo" in failures[0]
+
+
+def test_unknown_model_name_is_reported_as_such(tmp_path, monkeypatch):
+    cfg = _whisper_cfg(tmp_path, whisper_model="typo")
+    with (
+        other_checks_ok(monkeypatch),
+        patch("notetaker.whisper.model_is_downloaded", side_effect=ValueError("Invalid model size")),
+    ):
+        failures = run_preflight(cfg)
+    assert "unknown Whisper model name 'typo'" in failures[0]
+
+
+def test_present_model_passes(tmp_path, monkeypatch):
+    cfg = _whisper_cfg(tmp_path)
+    with (
+        other_checks_ok(monkeypatch),
+        patch("notetaker.whisper.model_is_downloaded", return_value=True),
+    ):
+        assert run_preflight(cfg) == []
+
+
+def test_missing_faster_whisper_package_is_a_clear_failure(tmp_path, monkeypatch):
+    cfg = _whisper_cfg(tmp_path)
+    with other_checks_ok(monkeypatch):
+        monkeypatch.setitem(sys.modules, "faster_whisper", None)
+        failures = run_preflight(cfg)
+    assert "faster-whisper is not installed" in failures[0]

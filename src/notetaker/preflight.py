@@ -103,7 +103,33 @@ def check_state_dir(cfg: Config) -> None:
         raise RuntimeError(f"Spool directory not writable: {cfg.spool_dir}")
 
 
-CHECK_NAMES = ("state-dir", "smtp", "nextcloud", "notes-target", "gemini")
+def check_whisper(cfg: Config) -> None:
+    """Confirm the local model is on disk. Never downloads: 1.6 GB at startup
+    would outlast the healthcheck's start period and the container would be
+    reported unhealthy while doing the right thing."""
+    from notetaker import whisper
+
+    try:
+        import faster_whisper  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "faster-whisper is not installed in this image; run: docker compose build"
+        ) from exc
+    try:
+        present = whisper.model_is_downloaded(cfg.whisper_model, cfg.whisper_model_dir)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"unknown Whisper model name {cfg.whisper_model!r} (WHISPER_MODEL): {exc}"
+        ) from exc
+    if not present:
+        raise RuntimeError(
+            f"Whisper model {cfg.whisper_model!r} is not downloaded to "
+            f"{cfg.whisper_model_dir}. Run: {whisper.DOWNLOAD_COMMAND} "
+            "— or set TRANSCRIPTION_BACKEND=gemini in .env"
+        )
+
+
+CHECK_NAMES = ("state-dir", "smtp", "nextcloud", "notes-target", "gemini", "whisper")
 
 
 def run_preflight(cfg: Config) -> list[str]:
@@ -120,6 +146,7 @@ def run_preflight(cfg: Config) -> list[str]:
         ("nextcloud", check_nextcloud),
         ("notes-target", check_notes_target),
         ("gemini", check_gemini),
+        ("whisper", check_whisper),
     ]
     if not cfg.email_enabled:
         # Nothing to probe, and localhost:25 inside the container is a
@@ -129,6 +156,10 @@ def run_preflight(cfg: Config) -> list[str]:
             "PREFLIGHT skipping smtp: email is disabled because SMTP_HOST is unset"
         )
         checks = [c for c in checks if c[0] != "smtp"]
+
+    if cfg.transcription_backend != "whisper":
+        log.info("PREFLIGHT skipping whisper: TRANSCRIPTION_BACKEND is %s", cfg.transcription_backend)
+        checks = [c for c in checks if c[0] != "whisper"]
 
     failures: list[str] = []
 
