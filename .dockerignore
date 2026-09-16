@@ -1,0 +1,18 @@
+# Everything here is either large, secret, or irrelevant to the image.
+models/
+notes/
+.env*
+.venv/
+.git/
+docs/
+tests/
+.superpowers/
+.workflow/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.webm
+*.mp3
+uv.lock
+requirements-captured.txt
+install-docker.sh

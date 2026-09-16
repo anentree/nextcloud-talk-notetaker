@@ -191,6 +191,9 @@ def test_smtp_defaults_point_at_the_docker_host(tmp_path):
 
 ENV_KEY_RE = re.compile(r"^#?\s*([A-Z][A-Z0-9_]+)=")
 
+# Read by docker-compose.yml (${VAR:-default} interpolation), not by Python.
+COMPOSE_ONLY_KEYS = {"NOTETAKER_MEMORY_LIMIT"}
+
 
 def env_example_keys() -> set[str]:
     keys = set()
@@ -370,9 +373,12 @@ def test_env_example_and_readme_document_every_setting_the_code_reads():
         f".env.example missing: {sorted(code - env_example_keys())}"
     )
     assert not code - readme, f"README table missing: {sorted(code - readme)}"
-    assert not env_example_keys() - code, (
-        f".env.example documents unknown settings: {sorted(env_example_keys() - code)}"
-    )
+    unknown = env_example_keys() - code - COMPOSE_ONLY_KEYS
+    assert not unknown, f".env.example documents unknown settings: {sorted(unknown)}"
+    assert not COMPOSE_ONLY_KEYS - readme, "README table missing a compose-only setting"
+    compose = (REPO / "docker-compose.yml").read_text()
+    for key in COMPOSE_ONLY_KEYS:
+        assert f"${{{key}:-" in compose, f"docker-compose.yml does not interpolate {key}"
 
 
 def test_env_backups_are_gitignored():
@@ -385,3 +391,21 @@ def test_env_backups_are_gitignored():
         check=False,
     )
     assert result.returncode == 0, ".env.bak.* is not ignored"
+
+
+def test_compose_mounts_the_model_directory_and_caps_memory_by_setting():
+    compose = (REPO / "docker-compose.yml").read_text()
+    assert "./models:/data/models" in compose
+    assert "memory: ${NOTETAKER_MEMORY_LIMIT:-2g}" in compose
+    assert "cpu_shares: 512" in compose
+
+
+def test_build_context_excludes_models_and_secrets():
+    ignore = (REPO / ".dockerignore").read_text().split()
+    for entry in ("models/", "notes/", ".env*", ".venv/", ".git/", "*.webm", "*.mp3"):
+        assert entry in ignore, entry
+    assert subprocess.run(["git", "check-ignore", "-q", "models/model.bin"], cwd=REPO).returncode == 0
+
+
+def test_faster_whisper_is_a_runtime_dependency():
+    assert re.search(r'"faster-whisper>=1\.1', (REPO / "pyproject.toml").read_text())

@@ -9,10 +9,16 @@ services:
       # If your Nextcloud host uses split-horizon DNS, Docker resolves it to the
       # public WAN IP and hairpin NAT fails. Pin it to the LAN address instead:
       #   - "cloud.example.com:192.168.1.10"
+    # Yield to Nextcloud under CPU contention (Whisper pins every core but one
+    # for the length of a transcription); no effect when the box is idle.
+    cpu_shares: 512
     deploy:
       resources:
         limits:
-          memory: 2g
+          # The wizard writes 6g for Whisper (large-v3-turbo int8 needs ~3 GB)
+          # and 2g for Gemini, which also contains a leaking Chromium. An
+          # install that never re-ran the wizard keeps 2g.
+          memory: ${NOTETAKER_MEMORY_LIMIT:-2g}
     # Without this the json-file driver grows without bound, and every
     # forensic log line is destroyed on the next `compose up --build`.
     logging:
@@ -39,3 +45,5 @@ services:
       - /tmp/notetaker-audio
     volumes:
       - ./notes:/data/notes
+      # Whisper model files (~1.6 GB); survive rebuilds, never in the build context.
+      - ./models:/data/models

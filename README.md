@@ -87,6 +87,7 @@ All configuration is via environment variables in `.env`:
 | `WHISPER_MODEL`               | No       | `large-v3-turbo`           | faster-whisper model name; `medium`/`small` are faster and less accurate       |
 | `WHISPER_LANGUAGE`            | No       | `en`                       | Two-letter language code for Whisper; empty = auto-detect                      |
 | `WHISPER_MODEL_DIR`           | No       | `/data/models`             | Model files inside the container (`./models` on the host)                      |
+| `NOTETAKER_MEMORY_LIMIT`      | No       | `2g`                       | Container memory cap read by docker-compose.yml; wizard sets `6g` for Whisper  |
 | `NOTES_STORAGE`               | No       | `nextcloud`                | `nextcloud` (WebDAV) or `local` (filesystem)                                   |
 | `NOTES_FOLDER`                | No       | `/Talk/Notes`              | Nextcloud folder for notes (the wizard sets `/meeting-notes`)                  |
 | `LOCAL_NOTES_DIR`             | No       | —                          | Local directory for notes (when storage=local)                                 |
