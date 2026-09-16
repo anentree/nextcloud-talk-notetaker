@@ -233,6 +233,38 @@ def test_whisper_backend_transcribes_labels_and_summarizes_once(
     assert meta["transcript"] == "[00:00] Jo: Let's start\n[00:10] Brantley: I agree"
 
 
+@patch("notetaker.transcriber._get_audio_duration", return_value=3960.0)
+@patch("notetaker.transcriber.summarize_transcript", return_value="# Notes")
+@patch("notetaker.transcriber.whisper_transcribe", return_value=SEGMENTS)
+@patch("notetaker.transcriber.transcribe_and_summarize")
+def test_malformed_timeline_keeps_the_transcript_unlabelled(
+    gemini_audio, whisper_tr, summarize, _dur, tmp_path
+):
+    """A hand-edited sidecar with a malformed speaker_events entry must not
+    cost the whole 45-minute transcription on retry — keep the transcript,
+    just without speaker labels.
+
+    Note: `label_transcript` raises KeyError on the missing `start_ms` key
+    (verified directly against src/notetaker/attribution.py), so this is
+    the exception path, not the tolerant one. The brief's assertion text
+    said the fallback transcript would contain "Unattributed"; verified
+    that `label_transcript(segments, [])` produces plain unlabelled lines
+    (`by_label` is `{}`, which is falsy, so `_label_for` — the only place
+    that emits the literal "Unattributed" — is never called). Asserting on
+    the unlabelled text instead, which is what the fallback actually does.
+    """
+    audio = tmp_path / "call.webm"
+    audio.write_bytes(b"x")
+    meta = {"speaker_events": [{"label": "Jo"}]}  # missing start_ms/end_ms
+
+    notes = make_notes(_cfg(), meta, str(audio), "Standup", "2026-09-15")
+
+    assert notes == "# Notes"
+    assert meta["transcript"] == "[00:00] Let's start\n[00:10] I agree"
+    assert "Let's start" in meta["transcript"]
+    gemini_audio.assert_not_called()
+
+
 @patch("notetaker.transcriber._get_audio_duration", return_value=600.0)
 @patch("notetaker.transcriber.summarize_transcript", return_value="# Notes")
 @patch("notetaker.transcriber.whisper_transcribe")
@@ -352,3 +384,27 @@ def test_gemini_backend_forwards_everything_as_keywords(gemini_audio, whisper_tr
         "heartbeat_fn": beat,
         "call_date": None,
     }
+
+
+@patch("notetaker.transcriber._get_audio_duration", return_value=3960.0)
+@patch("notetaker.transcriber.summarize_transcript", return_value="# Notes")
+@patch("notetaker.transcriber.whisper_transcribe")
+@patch("notetaker.transcriber.transcribe_and_summarize")
+def test_cached_transcript_is_summarized_even_on_the_gemini_backend(
+    gemini_audio, whisper_tr, summarize, _dur, tmp_path
+):
+    """Switching whisper -> gemini while a retained recording already holds
+    a finished Whisper transcript must not re-upload the audio."""
+    audio = tmp_path / "call.webm"
+    audio.write_bytes(b"x")
+    meta = {"transcript": "[00:00] Jo: Let's start"}
+
+    notes = make_notes(
+        _cfg(transcription_backend="gemini"), meta, str(audio), "Standup", "2026-09-15"
+    )
+
+    assert notes == "# Notes"
+    gemini_audio.assert_not_called()
+    whisper_tr.assert_not_called()
+    summarize.assert_called_once()
+    assert summarize.call_args.args[1] == "[00:00] Jo: Let's start"

@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 from notetaker.config import Config
 from notetaker.mailer import _is_local_target, _tls_context
-from notetaker.preflight import check_smtp, run_preflight
+from notetaker.preflight import check_smtp, container_memory_limit, run_preflight
 
 
 def make_cfg(**kw) -> Config:
@@ -320,3 +320,54 @@ def test_missing_faster_whisper_package_is_a_clear_failure(tmp_path, monkeypatch
         monkeypatch.setitem(sys.modules, "faster_whisper", None)
         failures = run_preflight(cfg)
     assert "faster-whisper is not installed" in failures[0]
+
+
+# --- whisper: container memory cap ------------------------------------------
+
+
+def test_whisper_check_fails_under_a_2g_memory_cap(tmp_path, monkeypatch):
+    limit_file = tmp_path / "memory.max"
+    limit_file.write_text("2147483648")
+    cfg = _whisper_cfg(tmp_path)
+    with (
+        other_checks_ok(monkeypatch),
+        patch("notetaker.whisper.model_is_downloaded", return_value=True),
+        patch(
+            "notetaker.preflight.CGROUP_MEMORY_LIMIT_FILES",
+            (str(limit_file), str(tmp_path / "missing")),
+        ),
+    ):
+        failures = run_preflight(cfg)
+    assert len(failures) == 1 and failures[0].startswith("whisper:")
+    assert "NOTETAKER_MEMORY_LIMIT=6g" in failures[0]
+    assert "2.0g" in failures[0]
+
+
+def test_whisper_check_passes_with_6g_or_no_cap(tmp_path, monkeypatch):
+    for content in ("6442450944", "max", None):
+        limit_file = tmp_path / "memory.max"
+        if content is None:
+            if limit_file.exists():
+                limit_file.unlink()
+        else:
+            limit_file.write_text(content)
+        cfg = _whisper_cfg(tmp_path)
+        with (
+            other_checks_ok(monkeypatch),
+            patch("notetaker.whisper.model_is_downloaded", return_value=True),
+            patch(
+                "notetaker.preflight.CGROUP_MEMORY_LIMIT_FILES",
+                (str(limit_file), str(tmp_path / "missing")),
+            ),
+        ):
+            assert run_preflight(cfg) == [], content
+
+
+def test_v1_no_limit_sentinel_means_unlimited(tmp_path):
+    v1_file = tmp_path / "memory.limit_in_bytes"
+    v1_file.write_text("9223372036854771712")
+    with patch(
+        "notetaker.preflight.CGROUP_MEMORY_LIMIT_FILES",
+        (str(tmp_path / "missing"), str(v1_file)),
+    ):
+        assert container_memory_limit() is None

@@ -256,8 +256,8 @@ EOF
 # aborting the wizard under set -e. The SETUP_* overrides exist for tests;
 # an empty override means "could not read".
 CPU_THREADS="${SETUP_CPU_THREADS-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)}"
-MEM_GB="${SETUP_MEM_GB-$(awk '/^MemTotal:/ {printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)}"
-MEM_AVAIL_GB="${SETUP_MEM_AVAIL_GB-$(awk '/^MemAvailable:/ {printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)}"
+MEM_GB="${SETUP_MEM_GB-$(awk '/^MemTotal:/ {printf "%.0f", $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)}"
+MEM_AVAIL_GB="${SETUP_MEM_AVAIL_GB-$(awk '/^MemAvailable:/ {printf "%.0f", $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)}"
 DISK_GB="${SETUP_DISK_GB-$(df -Pk . 2>/dev/null | awk 'NR==2 {printf "%d", $4/1048576}' || echo 0)}"
 ARCH="${SETUP_ARCH-$(uname -m 2>/dev/null || echo unknown)}"
 # AVX2: 1 = present, 0 = absent, "" = could not read (no /proc/cpuinfo).

@@ -21,7 +21,7 @@ def ev(label, start_s, end_s):
 
 def test_single_speaker_owns_every_line():
     out = label_transcript([seg(0, 5, "hello"), seg(10, 15, "again")], [ev("Jo", 0, 20)])
-    assert out == "[00:00] Jo: hello again" or out == "[00:00] Jo: hello\n[00:10] Jo: again"
+    assert out == "[00:00] Jo: hello\n[00:10] Jo: again"
 
 
 def test_far_apart_lines_do_not_merge_but_close_ones_do():

@@ -6,7 +6,7 @@ audio never leaves the machine. Two rules shape this file:
 - ``faster_whisper`` is imported inside the functions, never at module top.
   A Gemini-only install must not fail to start because a native library of
   a backend it does not use will not load.
-- Every slow step beats the heartbeat. A one-hour call takes 15-60 minutes
+- Every slow step beats the heartbeat. A one-hour call takes 45-60 minutes
   here on the single-threaded poll loop, and the container healthcheck
   declares the process dead after ~170 s without a beat.
 """
@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +161,9 @@ def transcribe(
         stderr = (exc.stderr or b"")[-400:]
         raise WhisperFailed(f"ffmpeg failed: {stderr!r}") from exc
     except Exception as exc:
+        # The traceback's frames pin the model; drop them so the trim below
+        # can actually return the arena. File/line survive for logging.
+        traceback.clear_frames(exc.__traceback__)
         raise WhisperFailed(f"{type(exc).__name__}: {exc}") from exc
     finally:
         # An un-drained generator (mid-decode failure) still references the

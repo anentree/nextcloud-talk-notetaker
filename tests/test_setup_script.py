@@ -528,3 +528,12 @@ def test_build_context_excludes_models_and_secrets():
 
 def test_faster_whisper_is_a_runtime_dependency():
     assert re.search(r'"faster-whisper>=1\.1', (REPO / "pyproject.toml").read_text())
+
+
+def test_memory_probes_round_to_the_nearest_gb():
+    """A kernel reports an 8 GB machine as ~7.6 GB; truncating would tell it
+    Whisper needs 8."""
+    script = (REPO / "setup.sh").read_text()
+    for key in ("MemTotal", "MemAvailable"):
+        line = next(l for l in script.splitlines() if f"/^{key}:/" in l)
+        assert 'printf "%.0f"' in line, line

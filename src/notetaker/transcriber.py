@@ -50,7 +50,7 @@ SEGMENT_MAX_OUTPUT_TOKENS = 16384
 # the retry path, which is true today (get_participant_emails returns []).
 WHISPER_MAX_FAILURES = 2
 # Stored in meta["transcript"] when Whisper finds no speech, so a retry
-# never re-runs a 20-minute transcription to learn the same thing.
+# never re-runs a 45-minute transcription to learn the same thing.
 NO_SPEECH_SENTINEL = "[NO SPEECH DETECTED]"
 
 
@@ -639,7 +639,8 @@ def make_notes(
     UpstreamUnavailable; the caller retains the recording either way.
     """
     speaker_events = meta.get("speaker_events") or []
-    if cfg.transcription_backend != "whisper":
+    transcript = meta.get("transcript")
+    if transcript is None and cfg.transcription_backend != "whisper":
         return transcribe_and_summarize(
             cfg.gemini_api_key,
             audio_path,
@@ -653,7 +654,6 @@ def make_notes(
 
     call_date = call_date or date.today().isoformat()
     duration_min = int(_get_audio_duration(audio_path) / 60)
-    transcript = meta.get("transcript")
     if transcript is None:
         failures = int(meta.get("whisper_failures", 0))
         attempts = int(meta.get("attempts", 0))
@@ -685,7 +685,16 @@ def make_notes(
         except WhisperFailed:
             meta["whisper_failures"] = failures + 1
             raise
-        transcript = label_transcript(segments, speaker_events) or NO_SPEECH_SENTINEL
+        try:
+            transcript = label_transcript(segments, speaker_events)
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning(
+                "Speaker timeline unusable (%s: %s); keeping the transcript unlabelled",
+                type(exc).__name__,
+                exc,
+            )
+            transcript = label_transcript(segments, [])
+        transcript = transcript or NO_SPEECH_SENTINEL
         meta["transcript"] = transcript
         log.info("Whisper transcript: %d chars", len(transcript))
 

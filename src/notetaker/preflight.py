@@ -103,6 +103,35 @@ def check_state_dir(cfg: Config) -> None:
         raise RuntimeError(f"Spool directory not writable: {cfg.spool_dir}")
 
 
+# cgroup v2 first, then v1. "max" (v2) or an absurdly large number (v1's
+# no-limit sentinel) means unlimited.
+CGROUP_MEMORY_LIMIT_FILES = (
+    "/sys/fs/cgroup/memory.max",
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+)
+WHISPER_MIN_MEMORY_BYTES = 4 * 1024**3
+
+
+def container_memory_limit() -> int | None:
+    """The cgroup memory cap in bytes, or None when unlimited or unreadable."""
+    for path in CGROUP_MEMORY_LIMIT_FILES:
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = f.read().strip()
+        except OSError:
+            continue
+        if raw == "max":
+            return None
+        try:
+            limit = int(raw)
+        except ValueError:
+            continue
+        if limit >= 1 << 40:  # v1 reports ~2**63 when no limit is set
+            return None
+        return limit
+    return None
+
+
 def check_whisper(cfg: Config) -> None:
     """Confirm the local model is on disk. Never downloads: 1.6 GB at startup
     would outlast the healthcheck's start period and the container would be
@@ -126,6 +155,14 @@ def check_whisper(cfg: Config) -> None:
             f"Whisper model {cfg.whisper_model!r} is not downloaded to "
             f"{cfg.whisper_model_dir}. Run: {whisper.DOWNLOAD_COMMAND} "
             "— or set TRANSCRIPTION_BACKEND=gemini in .env"
+        )
+
+    limit = container_memory_limit()
+    if limit is not None and limit < WHISPER_MIN_MEMORY_BYTES:
+        raise RuntimeError(
+            f"Whisper needs a container memory limit of at least 4g; this container "
+            f"has {limit / 1024**3:.1f}g. Set NOTETAKER_MEMORY_LIMIT=6g in .env and "
+            "run: docker compose up -d"
         )
 
 
