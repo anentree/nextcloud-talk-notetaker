@@ -246,6 +246,28 @@ def test_drain_treats_a_false_return_as_failure(tmp_path):
     assert _load(retained.sidecar_path(dest))["attempts"] == 1
 
 
+def test_drain_commits_the_attempt_before_running_it(tmp_path):
+    """A process killed mid-retry (an OOM kill is SIGKILL, not an exception)
+    must not replay the same attempt number forever, and make_notes reads the
+    count to decide when Whisper has had enough chances."""
+    dest = _retain(tmp_path, now=1000.0)
+    seen = {}
+
+    def process(meta, audio):
+        seen["memory"] = meta["attempts"]
+        seen["disk"] = _load(retained.sidecar_path(dest))["attempts"]
+        seen["next"] = _load(retained.sidecar_path(dest))["next_attempt_at"]
+        raise RuntimeError("killed")
+
+    later = 1000.0 + 24 * 3600
+    retained.drain(str(tmp_path / "retained"), process, now=later)
+
+    assert seen == {"memory": 1, "disk": 1, "next": later + retained._backoff_for(1)}
+    sidecar = _load(retained.sidecar_path(dest))
+    assert sidecar["attempts"] == 1
+    assert "killed" in sidecar["last_error"]
+
+
 def test_drain_retries_at_most_one_recording_per_call(tmp_path):
     """Each retry blocks the poll loop for minutes; never chain them.
 

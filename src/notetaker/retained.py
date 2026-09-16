@@ -15,7 +15,8 @@ Flow:
     retain()  -> moves the .webm into <retained_dir> and writes <name>.webm.json
                  beside it with everything _finish_recording() needs
     drain()   -> called every poll cycle; retries at most ONE due recording,
-                 deletes both files on success, backs off on failure
+                 deletes both files on success, backs off on failure; the
+                 attempt is committed to the sidecar before it runs
 
 Give-up is age-based and lives in main.prune_retained_audio(), which sweeps
 the sidecar along with the audio.
@@ -179,6 +180,14 @@ def drain(retained_dir: str, process_fn, now: float | None = None) -> tuple[int,
             continue
 
         attempt = int(meta.get("attempts", 0)) + 1
+        delay = _backoff_for(attempt)
+        # Commit the attempt before running it. A process killed mid-retry
+        # (an OOM kill is SIGKILL, not an exception) would otherwise replay
+        # the same attempt number forever, and transcriber.make_notes reads
+        # this count to decide when Whisper has had enough chances.
+        meta["attempts"] = attempt
+        meta["next_attempt_at"] = now + delay
+        _atomic_write(path, meta)
         log.info(
             "Retrying retained recording %s (attempt %d, retained %.1fh ago)",
             audio,
@@ -201,9 +210,6 @@ def drain(retained_dir: str, process_fn, now: float | None = None) -> tuple[int,
             log.info("Retained recording finished and removed: %s", audio)
             return 1, len(pending(retained_dir))
 
-        delay = _backoff_for(attempt)
-        meta["attempts"] = attempt
-        meta["next_attempt_at"] = now + delay
         meta.setdefault("last_error", "process_fn returned False")
         _atomic_write(path, meta)
         log.warning(
