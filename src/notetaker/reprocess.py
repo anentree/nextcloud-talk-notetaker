@@ -11,26 +11,28 @@ Usage inside the container:
     python -m notetaker.reprocess <file>.webm --participants Jo,brantley
     python -m notetaker.reprocess <file>.webm --dry-run
 
-Speaker attribution is weaker here than during a live call: the per-track
-VAD timeline is built while the call is happening and is not persisted with
-the audio, so reprocessing has only the mixed audio to work from. Pass
-`--participants` with the attendees that were ACTUALLY observed in the call
-(they are in the container log, "Call attendees observed in-call"). Do not
-pass the room's member list — supplying names that were never present is
-what made Gemini invent speakers and hand them action items.
+Since 2026-09-14 a retained recording has a `<file>.webm.json` sidecar beside
+it holding the speaker timeline and call context; when it exists it is used.
+Older recordings have only the mixed audio. Pass `--participants` with the
+attendees that were ACTUALLY observed in the call (they are in the container
+log, "Call attendees observed in-call"). Do not pass the room's member list —
+supplying names that were never present is what made Gemini invent speakers
+and hand them action items.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
 import sys
 
+from . import retained
 from .config import Config
 from .storage import upload_notes
-from .transcriber import transcribe_and_summarize
+from .transcriber import make_notes
 
 log = logging.getLogger("notetaker.reprocess")
 
@@ -51,6 +53,19 @@ def parse_retained_name(path: str) -> tuple[str, str, str]:
         m.group("date"),
         m.group("slug").replace("-", " ").title(),
     )
+
+
+def _load_sidecar(audio_path: str) -> dict:
+    """The retained sidecar written beside the recording, or {} for a
+    recording that predates it."""
+    path = retained.sidecar_path(audio_path)
+    try:
+        with open(path, encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    log.info("Using the speaker timeline and call context from %s", path)
+    return meta
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -98,13 +113,14 @@ def main(argv: list[str] | None = None) -> int:
         f" with attendees {participants}" if participants else " with no attendee list",
     )
 
-    notes = transcribe_and_summarize(
-        cfg.gemini_api_key,
+    meta = _load_sidecar(args.audio_path)
+    notes = make_notes(
+        cfg,
+        meta,
         args.audio_path,
         name,
-        model=cfg.gemini_model,
+        call_date or None,
         participant_names=participants or None,
-        call_date=call_date or None,
     )
     log.info("Produced %d chars of notes", len(notes))
 

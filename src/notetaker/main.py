@@ -17,7 +17,7 @@ from notetaker.participants import get_participant_emails
 from notetaker.preflight import run_preflight
 from notetaker.recorder import AudioRecorder
 from notetaker.storage import upload_notes
-from notetaker.transcriber import transcribe_and_summarize
+from notetaker.transcriber import make_notes
 
 log = logging.getLogger(__name__)
 
@@ -256,30 +256,28 @@ def _finish_recording(
     retry: transcribe, save, email. Returns True once the notes are durable."""
     token, name = meta["token"], meta["name"]
     call_start = datetime.fromisoformat(meta["call_start"])
-    speaker_events = meta.get("speaker_events") or []
 
     # 4. Transcribe + summarize
-    # Chunked transcription of a long call takes many minutes; keep the
-    # heartbeat fresh so the container doesn't report unhealthy while it is
-    # doing exactly what it is supposed to do.
+    # Transcribing a long call takes many minutes; keep the heartbeat fresh
+    # so the container doesn't report unhealthy while it is doing exactly
+    # what it is supposed to do.
     _touch_heartbeat(cfg)
     notes = meta.get("notes")
     if notes:
-        # A retry: the transcript survived in the sidecar. Doing it again
-        # would spend Gemini quota to produce different text.
+        # A retry: the notes survived in the sidecar. Doing it again would
+        # spend Gemini quota to produce different text.
         log.info("Reusing the notes from an earlier attempt for room %s", token)
     else:
         participant_names = [p["display_name"] for p in participants]
-        notes = transcribe_and_summarize(
-            cfg.gemini_api_key,
+        notes = make_notes(
+            cfg,
+            meta,
             audio_path,
             name,
-            model=cfg.gemini_model,
-            speaker_events=speaker_events,
+            # A retry runs days later; the notes are dated by the call.
+            call_start.date().isoformat(),
             participant_names=participant_names,
             heartbeat_fn=lambda: _touch_heartbeat(cfg),
-            # A retry runs days later; the notes are dated by the call.
-            call_date=call_start.date().isoformat(),
         )
         meta["notes"] = notes
     _touch_heartbeat(cfg)

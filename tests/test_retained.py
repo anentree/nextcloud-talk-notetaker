@@ -359,7 +359,7 @@ def _cfg(tmp_path):
 @patch("notetaker.main.deliver_notes")
 @patch("notetaker.main.upload_notes")
 @patch("notetaker.main.get_participant_emails")
-@patch("notetaker.main.transcribe_and_summarize")
+@patch("notetaker.transcriber.transcribe_and_summarize")
 @patch("notetaker.main.AudioRecorder")
 def test_failed_call_is_retained_with_its_recipients_and_later_finished(
     mock_recorder_cls,
@@ -433,7 +433,7 @@ def test_failed_call_is_retained_with_its_recipients_and_later_finished(
 @patch("notetaker.main.deliver_notes")
 @patch("notetaker.main.upload_notes")
 @patch("notetaker.main.get_participant_emails")
-@patch("notetaker.main.transcribe_and_summarize")
+@patch("notetaker.transcriber.transcribe_and_summarize")
 @patch("notetaker.main.AudioRecorder")
 def test_retry_resolves_recipients_if_the_live_call_died_before_it_could(
     mock_recorder_cls,
@@ -493,7 +493,7 @@ def test_retry_resolves_recipients_if_the_live_call_died_before_it_could(
 @patch("notetaker.main.deliver_notes")
 @patch("notetaker.main.upload_notes")
 @patch("notetaker.main.get_participant_emails")
-@patch("notetaker.main.transcribe_and_summarize")
+@patch("notetaker.transcriber.transcribe_and_summarize")
 @patch("notetaker.main.AudioRecorder")
 def test_retry_does_not_re_resolve_when_nobody_attended(
     mock_recorder_cls,
@@ -537,7 +537,7 @@ def test_retry_does_not_re_resolve_when_nobody_attended(
 @patch("notetaker.main.deliver_notes", return_value=True)
 @patch("notetaker.main.upload_notes", side_effect=RuntimeError("Nextcloud 502"))
 @patch("notetaker.main.get_participant_emails")
-@patch("notetaker.main.transcribe_and_summarize", return_value="# Notes")
+@patch("notetaker.transcriber.transcribe_and_summarize", return_value="# Notes")
 @patch("notetaker.main.AudioRecorder")
 def test_retry_reuses_the_notes_and_does_not_email_twice(
     mock_recorder_cls,
@@ -603,7 +603,7 @@ def test_retry_reuses_the_notes_and_does_not_email_twice(
 @patch("notetaker.main.deliver_notes", return_value=False)
 @patch("notetaker.main.upload_notes", side_effect=RuntimeError("Nextcloud 502"))
 @patch("notetaker.main.get_participant_emails")
-@patch("notetaker.main.transcribe_and_summarize", return_value="# Notes")
+@patch("notetaker.transcriber.transcribe_and_summarize", return_value="# Notes")
 @patch("notetaker.main.AudioRecorder")
 def test_a_spooled_email_also_counts_as_done(
     mock_recorder_cls,

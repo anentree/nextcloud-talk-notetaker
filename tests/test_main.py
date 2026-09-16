@@ -10,7 +10,7 @@ from datetime import datetime
 @patch("notetaker.main.deliver_notes")
 @patch("notetaker.main.upload_notes")
 @patch("notetaker.main.get_participant_emails")
-@patch("notetaker.main.transcribe_and_summarize")
+@patch("notetaker.transcriber.transcribe_and_summarize")
 @patch("notetaker.main.AudioRecorder")
 def test_handle_call_pipeline(
     mock_recorder_cls,
@@ -55,7 +55,7 @@ def test_handle_call_pipeline(
 @patch("notetaker.main.deliver_notes")
 @patch("notetaker.main.upload_notes")
 @patch("notetaker.main.get_participant_emails")
-@patch("notetaker.main.transcribe_and_summarize")
+@patch("notetaker.transcriber.transcribe_and_summarize")
 @patch("notetaker.main.AudioRecorder")
 def test_handle_call_skips_empty_audio(
     mock_recorder_cls,
@@ -125,7 +125,7 @@ def test_build_notes_filename_no_last_user():
 @patch("notetaker.main.deliver_notes")
 @patch("notetaker.main.upload_notes")
 @patch("notetaker.main.get_participant_emails")
-@patch("notetaker.main.transcribe_and_summarize")
+@patch("notetaker.transcriber.transcribe_and_summarize")
 @patch("notetaker.main.AudioRecorder")
 def test_handle_call_does_not_email_when_email_is_disabled(
     mock_recorder_cls,
@@ -187,7 +187,7 @@ def test_finish_recording_dates_the_notes_by_the_call_not_the_retry(tmp_path):
     audio = tmp_path / "a.webm"
     audio.write_bytes(b"x")
     with (
-        patch("notetaker.main.transcribe_and_summarize", return_value="# N") as tr,
+        patch("notetaker.transcriber.transcribe_and_summarize", return_value="# N") as tr,
         patch("notetaker.main.deliver_notes", return_value=True),
     ):
         assert _finish_recording(cfg, meta, str(audio), []) is True
