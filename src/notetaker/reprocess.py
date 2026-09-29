@@ -65,6 +65,12 @@ def _load_sidecar(audio_path: str) -> dict:
     except (OSError, ValueError):
         return {}
     log.info("Using the speaker timeline and call context from %s", path)
+    if meta.pop("parked", False):
+        # Parked after repeated Whisper failures; running this by hand is
+        # the decision to give Whisper a fresh set of tries.
+        meta.pop("whisper_failures", None)
+        meta.pop("attempts", None)
+        log.info("Recording was parked; retrying Whisper from scratch")
     return meta
 
 

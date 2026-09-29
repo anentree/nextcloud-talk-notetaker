@@ -94,6 +94,38 @@ def check_gemini(cfg: Config) -> None:
     resp.raise_for_status()
 
 
+def check_claude(cfg: Config) -> None:
+    """Prove the CLI is installed and the subscription token works, with the
+    smallest real request there is. A revoked token found here is a crash
+    loop at boot, not lost notes at the end of a meeting.
+
+    Only that kind of failure fails the check. A usage limit or an outage
+    would crash-loop the container for hours, missing every call, when the
+    retained-audio queue already copes with notes that cannot be written yet.
+    """
+    from notetaker.claude_notes import ClaudeUnavailable, claude_call
+
+    try:
+        # One short try: a hung API must not hold the poll loop (and every
+        # call that starts meanwhile) hostage at boot.
+        answer = claude_call(
+            "Reply with exactly: OK",
+            model=cfg.claude_model,
+            token=cfg.claude_oauth_token,
+            max_attempts=1,
+            timeout=60,
+        )
+    except ClaudeUnavailable as exc:
+        log.warning(
+            "PREFLIGHT claude: unreachable right now, starting anyway "
+            "(notes will queue until it answers): %s",
+            exc,
+        )
+        return
+    if "OK" not in answer.upper():
+        raise RuntimeError(f"unexpected answer from Claude: {answer[:100]!r}")
+
+
 def check_state_dir(cfg: Config) -> None:
     """Confirm the spool directory is writable — it is the failure safety net."""
     import os
@@ -166,7 +198,7 @@ def check_whisper(cfg: Config) -> None:
         )
 
 
-CHECK_NAMES = ("state-dir", "smtp", "nextcloud", "notes-target", "gemini", "whisper")
+CHECK_NAMES = ("state-dir", "smtp", "nextcloud", "notes-target", "gemini", "claude", "whisper")
 
 
 def run_preflight(cfg: Config) -> list[str]:
@@ -183,6 +215,7 @@ def run_preflight(cfg: Config) -> list[str]:
         ("nextcloud", check_nextcloud),
         ("notes-target", check_notes_target),
         ("gemini", check_gemini),
+        ("claude", check_claude),
         ("whisper", check_whisper),
     ]
     if not cfg.email_enabled:
@@ -193,6 +226,12 @@ def run_preflight(cfg: Config) -> list[str]:
             "PREFLIGHT skipping smtp: email is disabled because SMTP_HOST is unset"
         )
         checks = [c for c in checks if c[0] != "smtp"]
+
+    if cfg.notes_backend == "claude":
+        log.info("PREFLIGHT skipping gemini: NOTES_BACKEND is claude")
+        checks = [c for c in checks if c[0] != "gemini"]
+    else:
+        checks = [c for c in checks if c[0] != "claude"]
 
     if cfg.transcription_backend != "whisper":
         log.info("PREFLIGHT skipping whisper: TRANSCRIPTION_BACKEND is %s", cfg.transcription_backend)

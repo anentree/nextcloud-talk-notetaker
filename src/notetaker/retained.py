@@ -176,6 +176,9 @@ def drain(retained_dir: str, process_fn, now: float | None = None) -> tuple[int,
             _unlink(path)
             continue
 
+        if meta.get("parked"):
+            # transcriber.make_notes gave up on it; reprocess.py by hand.
+            continue
         if now < float(meta.get("next_attempt_at", 0)):
             continue
 

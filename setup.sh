@@ -531,6 +531,13 @@ GEMINI_API_KEY=$GEMINI_KEY
 # Gemini model for the notes (and for transcription when the backend is gemini)
 GEMINI_MODEL=gemini-2.5-flash-lite
 
+# Who writes the notes from the Whisper transcript: "gemini", or "claude"
+# (Claude Code on a Claude subscription; nothing goes to Google). See README.
+NOTES_BACKEND=gemini
+CLAUDE_MODEL=haiku
+# Long-lived subscription token from \`claude setup-token\` (NOTES_BACKEND=claude only)
+# CLAUDE_CODE_OAUTH_TOKEN=
+
 # Notes storage: "nextcloud" (upload via WebDAV) or "local" (save to filesystem)
 NOTES_STORAGE=$NOTES_STORAGE
 # Nextcloud folder path for notes (used when NOTES_STORAGE=nextcloud)

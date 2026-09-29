@@ -103,10 +103,13 @@ All configuration is via environment variables in `.env`:
 | `NEXTCLOUD_USER`              | Yes      | —                          | Bot username                                                                   |
 | `NEXTCLOUD_PASSWORD`          | Yes      | —                          | Bot password (or app password)                                                 |
 | `NEXTCLOUD_WEB_PASSWORD`      | No       | same as PASSWORD           | Separate browser login password (Yunohost SSO)                                 |
-| `GEMINI_API_KEY`              | Yes      | —                          | Google Gemini API key                                                          |
+| `GEMINI_API_KEY`              | Unless `NOTES_BACKEND=claude` | —            | Google Gemini API key                                                          |
 | `AUTH_METHOD`                 | No       | `nextcloud`                | `nextcloud` (standard login) or `yunohost` (SSO)                               |
 | `GEMINI_MODEL`                | No       | `gemini-2.5-flash-lite`    | Gemini model for the notes (and transcription when the backend is gemini)      |
 | `TRANSCRIPTION_BACKEND`       | No       | `gemini`                   | `whisper` (local, private, needs model download) or `gemini` (Google hears)    |
+| `NOTES_BACKEND`               | No       | `gemini`                   | Who writes the notes from a Whisper transcript: `gemini`, or `claude` (subscription, nothing to Google) |
+| `CLAUDE_MODEL`                | No       | `haiku`                    | Claude model when `NOTES_BACKEND=claude`                                        |
+| `CLAUDE_CODE_OAUTH_TOKEN`     | With `NOTES_BACKEND=claude` | —         | Subscription token from `claude setup-token`                                    |
 | `WHISPER_MODEL`               | No       | `large-v3-turbo`           | faster-whisper model name; `small` is about twice as fast and less accurate    |
 | `WHISPER_LANGUAGE`            | No       | `en`                       | Two-letter language code for Whisper; empty = auto-detect                      |
 | `WHISPER_MODEL_DIR`           | No       | `/data/models`             | Model files inside the container (`./models` on the host)                      |

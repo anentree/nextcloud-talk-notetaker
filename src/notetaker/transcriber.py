@@ -12,6 +12,7 @@ from google import genai
 from google.genai import types
 
 from notetaker.attribution import label_transcript
+from notetaker.claude_notes import claude_call
 from notetaker.whisper import WhisperFailed
 from notetaker.whisper import transcribe as whisper_transcribe
 
@@ -49,6 +50,11 @@ SEGMENT_MAX_OUTPUT_TOKENS = 16384
 # died without recording anything (attempts > WHISPER_MAX_FAILURES). Assumes nothing before make_notes raises on
 # the retry path, which is true today (get_participant_emails returns []).
 WHISPER_MAX_FAILURES = 2
+# NOTES_BACKEND=claude has no audio fallback, so Whisper gets two more tries
+# instead. Past this the recording is parked: a recording that fails every
+# time (corrupt audio, or one that OOM-kills the container) would otherwise
+# be retried for 30 days, each run blocking the poll loop for up to ~45 min.
+CLAUDE_WHISPER_MAX_FAILURES = 4
 # Stored in meta["transcript"] when Whisper finds no speech, so a retry
 # never re-runs a 45-minute transcription to learn the same thing.
 NO_SPEECH_SENTINEL = "[NO SPEECH DETECTED]"
@@ -598,17 +604,54 @@ def summarize_transcript(
 ) -> str:
     """One text-only Gemini call: an already-attributed transcript → notes."""
     client = genai.Client(api_key=api_key)
-    prompt = TRANSCRIPT_SYNTHESIS_PROMPT.format(
+    prompt = _synthesis_prompt(
+        transcript, conversation_name, call_date, duration_min, participant_names
+    )
+    log.info("Synthesizing notes from a %d-char transcript", len(transcript))
+    notes = _gemini_call(
+        client, [prompt], max_output_tokens=16384, model=model, heartbeat_fn=heartbeat_fn
+    )
+    log.info("Final notes: %d chars", len(notes))
+    return notes
+
+
+def _synthesis_prompt(
+    transcript: str,
+    conversation_name: str,
+    call_date: str,
+    duration_min: int,
+    participant_names: list[str] | None,
+) -> str:
+    return TRANSCRIPT_SYNTHESIS_PROMPT.format(
         conversation_name=conversation_name,
         date=call_date,
         duration_min=int(duration_min),
         participants_block=_format_participants_block(participant_names),
         transcript=transcript,
     )
-    log.info("Synthesizing notes from a %d-char transcript", len(transcript))
-    notes = _gemini_call(
-        client, [prompt], max_output_tokens=16384, model=model, heartbeat_fn=heartbeat_fn
+
+
+def summarize_transcript_claude(
+    token: str,
+    transcript: str,
+    conversation_name: str,
+    call_date: str,
+    duration_min: int,
+    participant_names: list[str] | None = None,
+    model: str = "haiku",
+    heartbeat_fn=None,
+) -> str:
+    """The same synthesis prompt, answered by Claude through the Claude Code
+    CLI on a subscription instead of by Gemini. Only text leaves the box."""
+    prompt = _synthesis_prompt(
+        transcript, conversation_name, call_date, duration_min, participant_names
     )
+    log.info(
+        "Synthesizing notes with Claude (%s) from a %d-char transcript",
+        model,
+        len(transcript),
+    )
+    notes = claude_call(prompt, model=model, token=token, heartbeat_fn=heartbeat_fn)
     log.info("Final notes: %d chars", len(notes))
     return notes
 
@@ -657,7 +700,32 @@ def make_notes(
     if transcript is None:
         failures = int(meta.get("whisper_failures", 0))
         attempts = int(meta.get("attempts", 0))
-        if failures >= WHISPER_MAX_FAILURES or attempts > WHISPER_MAX_FAILURES:
+        gave_up = failures >= WHISPER_MAX_FAILURES or attempts > WHISPER_MAX_FAILURES
+        if gave_up and cfg.notes_backend == "claude":
+            # Claude takes no audio, and the point of this backend is that
+            # nothing goes to Google. Give Whisper a couple more tries, then
+            # park the recording for a human (reprocess.py).
+            if (
+                failures >= CLAUDE_WHISPER_MAX_FAILURES
+                or attempts > CLAUDE_WHISPER_MAX_FAILURES
+            ):
+                meta["parked"] = True
+                log.error(
+                    "Whisper failed %d time(s) over %d attempt(s) on %s; parking it "
+                    "(NOTES_BACKEND=claude has no audio fallback). Recover by hand "
+                    "with reprocess.py before the 30-day prune deletes it",
+                    failures,
+                    attempts,
+                    audio_path,
+                )
+                raise WhisperFailed(f"parked after {failures} Whisper failure(s)")
+            log.warning(
+                "Whisper failed %d time(s) over %d attempt(s) on this recording; "
+                "NOTES_BACKEND=claude, so not falling back to Gemini audio",
+                failures,
+                attempts,
+            )
+        elif gave_up:
             log.warning(
                 "Whisper failed %d time(s) over %d attempt(s) on this recording; "
                 "using Gemini audio transcription for it instead",
@@ -701,6 +769,18 @@ def make_notes(
     if transcript == NO_SPEECH_SENTINEL:
         log.warning("No speech detected in %s; writing placeholder notes", audio_path)
         return _no_speech_notes(conversation_name, call_date, duration_min)
+
+    if cfg.notes_backend == "claude":
+        return summarize_transcript_claude(
+            cfg.claude_oauth_token,
+            transcript,
+            conversation_name,
+            call_date,
+            duration_min=duration_min,
+            participant_names=participant_names,
+            model=cfg.claude_model,
+            heartbeat_fn=heartbeat_fn,
+        )
 
     return summarize_transcript(
         cfg.gemini_api_key,

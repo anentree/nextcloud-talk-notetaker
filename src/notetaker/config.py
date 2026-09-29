@@ -39,6 +39,13 @@ class Config:
     # the chunked path); "whisper" transcribes locally and sends Gemini one
     # text request. Gemini always writes the notes, so the key stays required.
     transcription_backend: str = "gemini"
+    # Who writes the notes from a Whisper transcript. "gemini" uses the API
+    # key above; "claude" runs Claude Code headless on a subscription
+    # (CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`) and never sends
+    # anything to Google, so GEMINI_API_KEY becomes optional.
+    notes_backend: str = "gemini"
+    claude_model: str = "haiku"
+    claude_oauth_token: str = ""
     whisper_model: str = "large-v3-turbo"
     whisper_model_dir: str = "/data/models"
     # Two-letter code; empty means auto-detect (decided from the first 30 s
@@ -112,6 +119,23 @@ class Config:
                 "TRANSCRIPTION_BACKEND must be 'gemini' or 'whisper' "
                 f"(got {self.transcription_backend!r})"
             )
+        if self.notes_backend not in ("gemini", "claude"):
+            problems.append(
+                f"NOTES_BACKEND must be 'gemini' or 'claude' (got {self.notes_backend!r})"
+            )
+        if self.notes_backend == "claude":
+            if not self.claude_oauth_token:
+                problems.append(
+                    "NOTES_BACKEND=claude requires CLAUDE_CODE_OAUTH_TOKEN "
+                    "(run `claude setup-token` on any machine logged in to the subscription)"
+                )
+            if self.transcription_backend != "whisper":
+                problems.append(
+                    "NOTES_BACKEND=claude requires TRANSCRIPTION_BACKEND=whisper "
+                    "(Claude cannot transcribe audio)"
+                )
+        elif not self.gemini_api_key:
+            problems.append("GEMINI_API_KEY is required unless NOTES_BACKEND=claude")
         if self.poll_interval < 1:
             problems.append("POLL_INTERVAL_SECONDS must be >= 1")
         return problems
@@ -148,7 +172,6 @@ class Config:
             "NEXTCLOUD_URL",
             "NEXTCLOUD_USER",
             "NEXTCLOUD_PASSWORD",
-            "GEMINI_API_KEY",
         ]
         for var in required:
             if not os.environ.get(var):
@@ -161,12 +184,15 @@ class Config:
             nextcloud_web_password=os.getenv(
                 "NEXTCLOUD_WEB_PASSWORD", os.environ["NEXTCLOUD_PASSWORD"]
             ),
-            gemini_api_key=os.environ["GEMINI_API_KEY"],
+            gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
             auth_method=os.getenv("AUTH_METHOD", "nextcloud"),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
             transcription_backend=os.getenv("TRANSCRIPTION_BACKEND", "gemini")
             .strip()
             .lower(),
+            notes_backend=os.getenv("NOTES_BACKEND", "gemini").strip().lower(),
+            claude_model=os.getenv("CLAUDE_MODEL", "haiku").strip() or "haiku",
+            claude_oauth_token=os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip(),
             whisper_model=os.getenv("WHISPER_MODEL", "large-v3-turbo").strip()
             or "large-v3-turbo",
             whisper_model_dir=os.getenv("WHISPER_MODEL_DIR", "/data/models"),
