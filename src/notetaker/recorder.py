@@ -849,10 +849,17 @@ def _others_in_call(base_url: str, auth: tuple, room_token: str, own_user: str) 
 CHAT_PATH = "/ocs/v2.php/apps/spreed/api/v1/chat/{token}"
 
 SILENCE_MESSAGE = (
-    "⚠️ AI Notetaker: I have heard NO audio for {minutes} minutes. If you are "
-    "talking, I am NOT recording you. Hang up and start the call again and I "
-    "will rejoin. Reply to this chat (anything) to make me stop asking."
+    "{mentions}⚠️ AI Notetaker: I have heard NO audio for {minutes} minutes. If "
+    "you are talking, I am NOT recording you. Hang up and start the call again "
+    "and I will rejoin. Reply to this chat, or react to this message, to make "
+    "me stop asking."
 )
+# Repeats back off (1, 2, 4 ... minutes) up to this multiple of the first
+# interval, and go on until someone answers: an all-muted hour must not put
+# sixty warnings in the room's history.
+SILENCE_MAX_BACKOFF = 5
+# Who can answer a warning: people, not other bots or bridges.
+HUMAN_ACTOR_TYPES = {"users", "guests", "emails", "federated_users"}
 SILENCE_ACK_MESSAGE = "AI Notetaker: OK, I will stop asking about the silence."
 
 
@@ -869,11 +876,23 @@ def _post_chat(base_url: str, auth: tuple, room_token: str, message: str) -> int
     return int(resp.json()["ocs"]["data"]["id"])
 
 
+def _mentions(user_ids) -> str:
+    """Talk mentions for these users, so the warning notifies them: group
+    rooms notify on mentions only by default."""
+    return "".join(f'@"{uid}" ' for uid in sorted(user_ids))
+
+
 def _someone_replied(
-    base_url: str, auth: tuple, room_token: str, own_user: str, after_id: int
+    base_url: str,
+    auth: tuple,
+    room_token: str,
+    own_user: str,
+    after_id: int,
+    warning_ids: set[int] | frozenset[int] = frozenset(),
 ) -> bool:
-    """True once a person has written anything in the chat after ``after_id``.
-    Reads without moving the bot's read marker or waiting for new messages."""
+    """True once a person has written anything in the chat after ``after_id``,
+    or reacted to one of ``warning_ids``. Reads without moving the bot's read
+    marker or waiting for new messages."""
     resp = requests.get(
         base_url + CHAT_PATH.format(token=room_token),
         auth=auth,
@@ -892,12 +911,20 @@ def _someone_replied(
     if resp.status_code == 304:
         return False
     resp.raise_for_status()
-    return any(
-        m.get("actorId") != own_user
-        and m.get("messageType", "comment") == "comment"
-        and not m.get("systemMessage")
-        for m in resp.json()["ocs"]["data"]
-    )
+    for m in resp.json()["ocs"]["data"]:
+        if m.get("actorId") == own_user:
+            continue
+        if m.get("actorType", "users") not in HUMAN_ACTOR_TYPES:
+            continue
+        if m.get("messageType", "comment") == "comment" and not m.get(
+            "systemMessage"
+        ):
+            return True
+        # A reaction arrives as a system message pointing at its parent.
+        parent = m.get("parent") or {}
+        if m.get("systemMessage") == "reaction" and parent.get("id") in warning_ids:
+            return True
+    return False
 
 
 class AudioRecorder:
@@ -1268,8 +1295,13 @@ class AudioRecorder:
             # One silence episode: the first warning's id (replies are looked
             # for after it), when the last one went out, and whether someone
             # answered. Reset when anyone is heard again.
+            # Who is in the call now; kept from the last good presence poll
+            # when one fails, for mentioning them in a silence warning.
+            current_ids: set[str] = set()
             warned_first_id = None
+            warned_ids: set[int] = set()
             warned_last_at = None
+            warn_interval = self.silence_repeat_s
             silence_acknowledged = False
             while True:
                 await asyncio.sleep(10)
@@ -1381,6 +1413,7 @@ class AudioRecorder:
                             room_token,
                             self.user,
                             warned_first_id,
+                            warned_ids,
                         ):
                             silence_acknowledged = True
                             log.info(
@@ -1395,16 +1428,27 @@ class AudioRecorder:
                             )
                         elif (
                             warned_last_at is None
-                            or time.monotonic() - warned_last_at
-                            >= self.silence_repeat_s
+                            or time.monotonic() - warned_last_at >= warn_interval
                         ):
+                            if warned_last_at is not None:
+                                warn_interval = min(
+                                    warn_interval * 2,
+                                    self.silence_repeat_s * SILENCE_MAX_BACKOFF,
+                                )
+                            # Set before posting: a room where the bot cannot
+                            # write (403/412) is retried at this pace, not on
+                            # every 10-second poll.
+                            warned_last_at = time.monotonic()
                             message_id = _post_chat(
                                 self.nextcloud_url,
                                 auth,
                                 room_token,
-                                SILENCE_MESSAGE.format(minutes=int(voice_ago // 60)),
+                                SILENCE_MESSAGE.format(
+                                    mentions=_mentions(current_ids),
+                                    minutes=int(voice_ago // 60),
+                                ),
                             )
-                            warned_last_at = time.monotonic()
+                            warned_ids.add(message_id)
                             if warned_first_id is None:
                                 warned_first_id = message_id
                             log.warning(
@@ -1425,7 +1469,9 @@ class AudioRecorder:
                 elif self.silence_alert_s and voice_ago < self.silence_alert_s:
                     # Heard again: a later silence is a new episode.
                     warned_first_id = None
+                    warned_ids = set()
                     warned_last_at = None
+                    warn_interval = self.silence_repeat_s
                     silence_acknowledged = False
 
                 if others_present and self_in_call and live_audio == 0:

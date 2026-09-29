@@ -375,15 +375,31 @@ def _warnings(post):
 
 
 @pytest.mark.asyncio
-async def test_a_long_silence_is_announced_in_the_chat_every_minute():
+async def test_a_long_silence_is_announced_in_the_chat_until_answered():
     here = ({"neo", "piyush"}, 2, True)
     post, _ = await _record_with_chat([here] * 13, [301 + 10 * i for i in range(13)])
     warnings = _warnings(post)
-    # Polls are 10s apart: a warning on the first silent poll, then one per
-    # minute — polls 1, 7 and 13.
-    assert len(warnings) == 3
+    # Polls are 10s apart: a warning on the first silent poll, the next a
+    # minute later (poll 7), then backing off.
+    assert len(warnings) == 2
     assert "NOT recording" in warnings[0] and "Reply" in warnings[0]
     assert post.call_args_list[0].args[2] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_repeats_back_off_to_every_five_minutes_and_never_stop():
+    here = ({"neo"}, 1, True)
+    polls = 104
+    post, _ = await _record_with_chat([here] * polls, [400] * polls)
+    # Intervals 1, 2, 4, then 5, 5 minutes: polls 1, 7, 19, 43, 73, 103.
+    assert len(_warnings(post)) == 6
+
+
+@pytest.mark.asyncio
+async def test_the_warning_mentions_the_people_in_the_call():
+    here = ({"neo", "piyush"}, 2, True)
+    post, _ = await _record_with_chat([here] * 2, [400] * 2)
+    assert _warnings(post)[0].startswith('@"neo" @"piyush" ')
 
 
 @pytest.mark.asyncio
@@ -431,11 +447,36 @@ async def test_the_warning_can_be_turned_off():
 
 @pytest.mark.asyncio
 async def test_a_chat_failure_does_not_stop_the_recording_and_is_retried():
+    """A room the bot cannot write in is retried at the repeat pace, not on
+    every 10-second poll (and does not end the recording)."""
     here = ({"neo"}, 1, True)
     post, _ = await _record_with_chat(
-        [here] * 3, [400] * 3, post_error=[RuntimeError("503"), 501, 502]
+        [here] * 8, [400] * 8, post_error=[RuntimeError("403"), 501, 502]
     )
-    assert post.call_count >= 2  # tried again on the next poll
+    assert post.call_count == 2  # poll 1 failed, poll 7 retried
+
+
+@pytest.mark.asyncio
+async def test_a_reply_after_the_first_of_several_warnings_counts():
+    """Replies are looked for after the FIRST warning: one written between
+    warning 1 and warning 2 must not be missed."""
+    here = ({"neo"}, 1, True)
+    post, reply = await _record_with_chat(
+        [here] * 12, [400] * 12, replied=[False] * 7 + [True]
+    )
+    assert len(_warnings(post)) == 2
+    assert {c.args[4] for c in reply.call_args_list} == {500}
+    assert reply.call_args_list[-1].args[5] == {500, 501}
+
+
+@pytest.mark.asyncio
+async def test_after_an_acknowledged_silence_a_new_one_warns_again():
+    here = ({"neo"}, 1, True)
+    voice = [400, 410, 5, 400]
+    post, _ = await _record_with_chat([here] * 4, voice, replied=[True])
+    # Poll 1 warns, poll 2 sees the reply (ACK), poll 3 hears someone,
+    # poll 4 is a new silence and warns again.
+    assert len(_warnings(post)) == 2
 
 
 @pytest.mark.asyncio
@@ -457,16 +498,33 @@ def test_post_chat_sends_the_message_and_returns_its_id():
     assert responses.calls[0].request.body == "message=hello"
 
 
+def _msg(**fields):
+    base = {"actorType": "users", "actorId": "neo", "messageType": "comment"}
+    base.update(fields)
+    base.setdefault("systemMessage", "")
+    return base
+
+
 @pytest.mark.parametrize(
     "messages,expected",
     [
         ([], False),
-        ([{"actorId": "bot", "messageType": "comment", "systemMessage": ""}], False),
+        ([_msg(actorId="bot")], False),
+        ([_msg(messageType="system", systemMessage="call_left")], False),
+        ([_msg(messageType="comment_deleted")], False),
+        ([_msg(systemMessage="message_edited")], False),
+        ([_msg(actorType="bots", actorId="some-bot")], False),
+        ([_msg(actorType="bridged", actorId="relay")], False),
         (
-            [{"actorId": "neo", "messageType": "system", "systemMessage": "call_left"}],
+            [_msg(messageType="system", systemMessage="reaction", parent={"id": 999})],
             False,
         ),
-        ([{"actorId": "neo", "messageType": "comment", "systemMessage": ""}], True),
+        (
+            [_msg(messageType="system", systemMessage="reaction", parent={"id": 501})],
+            True,
+        ),
+        ([_msg(actorType="guests", actorId="guest-1")], True),
+        ([_msg()], True),
     ],
 )
 @responses.activate
@@ -476,7 +534,8 @@ def test_someone_replied_counts_only_a_person_writing(messages, expected):
     url = f"{NEXTCLOUD_URL}/ocs/v2.php/apps/spreed/api/v1/chat/abc123"
     responses.get(url, json={"ocs": {"data": messages}})
     assert (
-        _someone_replied(NEXTCLOUD_URL, ("bot", "s"), "abc123", "bot", 500) is expected
+        _someone_replied(NEXTCLOUD_URL, ("bot", "s"), "abc123", "bot", 500, {500, 501})
+        is expected
     )
     query = responses.calls[0].request.url
     for part in (
@@ -484,6 +543,8 @@ def test_someone_replied_counts_only_a_person_writing(messages, expected):
         "lastKnownMessageId=500",
         "setReadMarker=0",
         "timeout=0",
+        "noStatusUpdate=1",
+        "markNotificationsAsRead=0",
     ):
         assert part in query
 
