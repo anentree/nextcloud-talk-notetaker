@@ -389,3 +389,57 @@ async def test_a_slow_alert_does_not_hold_up_the_polls():
     # Polls kept running while the alert was still being sent.
     assert polled_during_alert
     assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_the_open_dialog_check_uses_the_visible_only_locator():
+    """The unfiltered dialog locator can report a hidden modal as the first
+    match; only the visible=true one decides whether a dialog is open."""
+    dropped = ({"neo"}, 1, False)
+    recorder, pw_ctx, join = _join_tracking_page()
+    visible_only = MagicMock()
+    visible_only.first = AsyncMock()
+    visible_only.first.is_visible = AsyncMock(return_value=False)
+    visible_only.first.click = AsyncMock()
+    join.dialog.first.is_visible = AsyncMock(return_value=True)  # unfiltered
+    route = join.page.locator
+
+    def locator(selector):
+        if "visible=true" in selector:
+            return visible_only
+        return route(selector)
+
+    join.page.locator = locator
+    seq = iter([dropped, dropped, ({"neo"}, 1, True)])
+    with (
+        patch("playwright.async_api.async_playwright", return_value=pw_ctx),
+        patch(
+            "notetaker.recorder._call_presence",
+            side_effect=lambda *a, **k: next(seq, (set(), 0, True)),
+        ),
+        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
+    ):
+        await recorder.record_call("abc123", "Talk")
+    visible_only.first.click.assert_not_called()
+    assert join.first.click.await_count == 2  # first join + rejoin via top bar
+
+
+@pytest.mark.asyncio
+async def test_the_recorder_measures_its_time_in_the_call():
+    here = ({"neo"}, 1, True)
+    clock = iter([1000.0] + [1000.0 + 10 * i for i in range(1, 40)])
+    recorder, pw_ctx, _ = _join_tracking_page()
+    seq = iter([here] * 3)
+    with (
+        patch("playwright.async_api.async_playwright", return_value=pw_ctx),
+        patch(
+            "notetaker.recorder._call_presence",
+            side_effect=lambda *a, **k: next(seq, (set(), 0, True)),
+        ),
+        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
+        patch("notetaker.recorder.time.monotonic", side_effect=lambda: next(clock)),
+    ):
+        await recorder.record_call("abc123", "Talk")
+    # Joined at 1000; the grace period (60s) is not counted.
+    assert recorder.in_call_s is not None
+    assert recorder.in_call_s < 100

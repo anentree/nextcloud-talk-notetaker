@@ -29,7 +29,7 @@ import os
 import re
 import sys
 
-from . import retained, transcripts
+from . import retained, transcriber, transcripts, verify
 from .config import Config
 from .storage import upload_notes
 from .transcriber import NO_SPEECH_SENTINEL, make_notes
@@ -140,6 +140,11 @@ def main(argv: list[str] | None = None) -> int:
         help="transcribe and print to stdout without saving anywhere",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="upload the notes even if they fail content verification",
+    )
+    parser.add_argument(
         "--release",
         action="store_true",
         help=(
@@ -193,6 +198,29 @@ def main(argv: list[str] | None = None) -> int:
         participant_names=participants or None,
     )
     log.info("Produced %d chars of notes", len(notes))
+
+    # Same check as a live call before anything reaches the shared folder: a
+    # recording retained during an outage has never been judged.
+    try:
+        duration_s = transcriber._get_audio_duration(args.audio_path)
+    except Exception:  # noqa: BLE001 — unknown length: verify.py holds
+        duration_s = meta.get("recorded_s")
+    problems = verify.check_content(
+        cfg,
+        notes,
+        meta.get("transcript")
+        if meta.get("transcript") is not None
+        else meta.get("gemini_transcript"),
+        duration_s,
+        NO_SPEECH_SENTINEL,
+    )
+    if problems and not (args.dry_run or args.out or args.force):
+        log.error(
+            "Not uploading: the notes failed content verification (%s). Look "
+            "with --dry-run or --out, or upload anyway with --force",
+            "; ".join(problems),
+        )
+        return 1
 
     if args.dry_run:
         sys.stdout.write(notes)

@@ -584,3 +584,66 @@ def test_a_failed_retain_does_not_name_a_wrong_path(tmp_path):
         _, _, mocks = _run_call(cfg, tmp_path, SILENT)
     body = mocks["email"].call_args_list[0].args[1]["body"]
     assert "--release" not in body and "could not be moved" in body
+
+
+def _unjudged_retained(tmp_path, cfg):
+    os.makedirs(cfg.retained_audio_dir, exist_ok=True)
+    audio = os.path.join(cfg.retained_audio_dir, "itujzrjw-2026-09-29-talk.webm")
+    with open(audio, "wb") as f:
+        f.write(b"a")
+    retained._atomic_write(
+        retained.sidecar_path(audio),
+        {"token": "itujzrjw", "transcript": "[00:12] Thanks for watching!"},
+    )
+    return audio
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_plain_reprocess_verifies_before_uploading(tmp_path, monkeypatch, force):
+    """A recording retained during an outage was never judged."""
+    from notetaker import reprocess
+
+    cfg = _pipeline_cfg(tmp_path)
+    audio = _unjudged_retained(tmp_path, cfg)
+    _release_env(monkeypatch)
+    with (
+        patch("notetaker.transcriber._get_audio_duration", return_value=4680.0),
+        patch("notetaker.transcriber.summarize_transcript", return_value=NOTES),
+        patch("notetaker.reprocess.upload_notes") as upload,
+        patch("notetaker.transcripts.upload_notes"),
+    ):
+        rc = reprocess.main([audio, "--force"] if force else [audio])
+    assert rc == (0 if force else 1)
+    assert upload.called is force
+
+
+def test_a_passing_call_is_marked_verified_for_its_retries(tmp_path):
+    """Passed, then the upload failed: the retry must not re-judge it."""
+    cfg = _pipeline_cfg(tmp_path)
+    with patch("notetaker.main._save_notes", side_effect=RuntimeError("502")):
+        _, held, _ = _run_call(cfg, tmp_path, TALKING, minutes=60)
+    with open(retained.sidecar_path(held), encoding="utf-8") as f:
+        sidecar = json.load(f)
+    assert sidecar["verified"] is True
+    assert "held" not in sidecar and "parked" not in sidecar
+
+
+def test_the_fallback_length_is_the_recorders_time_in_the_call():
+    from datetime import datetime, timedelta
+
+    from notetaker.main import _in_call_seconds
+
+    start = datetime.now() - timedelta(minutes=10)  # noqa: DTZ005 — the code uses naive local time
+    measured = MagicMock(in_call_s=321.0)
+    assert _in_call_seconds(measured, start) == 321.0
+    unmeasured = MagicMock(in_call_s=None)
+    assert 590 < _in_call_seconds(unmeasured, start) < 610
+
+
+def test_a_silence_alert_failure_is_logged_not_raised(tmp_path, caplog):
+    from notetaker.main import _alert_silence
+
+    cfg = _pipeline_cfg(tmp_path, smtp_host="host.docker.internal")
+    with patch("notetaker.main.deliver_notes", side_effect=OSError("smtp down")):
+        _alert_silence(cfg, "itujzrjw", "Talk", 400.0, 1, 0)
+    assert "Could not send the silence alert" in caplog.text

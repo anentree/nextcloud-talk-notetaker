@@ -560,6 +560,8 @@ LOCAL_NOTES_DIR=$LOCAL_NOTES_DIR
 # MIN_SPEECH_CHARS_PER_MINUTE characters of speech per minute, or whose notes
 # are empty, is HELD: the audio is kept, nothing is emailed or shared, and
 # ALERT_EMAIL is told. Release one by hand with reprocess.py --release.
+# With TRANSCRIPTION_BACKEND=gemini, calls of 5-10 minutes are transcribed in one
+# pass with no transcript to check against, so they are always held.
 # MIN_SPEECH_CHARS_PER_MINUTE=30
 # VERIFY_MIN_MINUTES=5
 # ALERT_EMAIL=

@@ -219,6 +219,16 @@ def _in_call_seconds(recorder, call_start: datetime) -> float:
 def _alert_silence(
     cfg: Config, token: str, name: str, silent_s: float, others: int, rejoins: int
 ) -> None:
+    try:
+        _send_silence_alert(cfg, token, name, silent_s, others, rejoins)
+    except Exception:
+        # Runs in a background thread; its result may never be collected.
+        log.exception("Could not send the silence alert for room %s", token)
+
+
+def _send_silence_alert(
+    cfg: Config, token: str, name: str, silent_s: float, others: int, rejoins: int
+) -> None:
     _send_alert(
         cfg,
         {"token": token, "name": name},
@@ -231,7 +241,8 @@ def _alert_silence(
             "",
             (
                 "If people are talking, it is NOT recording them. Hang up and start "
-                "the call again; the notetaker joins the new call on its own."
+                "the call again; the notetaker joins the new call on its own. (If "
+                "everyone is simply muted, ignore this.)"
             ),
             "",
             f"Rejoins it has already tried on its own this call: {rejoins}.",
