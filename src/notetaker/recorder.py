@@ -43,6 +43,7 @@ AUDIO_CAPTURE_INIT_JS = """
     // VAD_THRESHOLD is templated from Python (env-configurable).
     const VAD_THRESHOLD = __VAD_THRESHOLD__;
     const VAD_HANGOVER_MS = 400; // silence duration that ends an utterance
+    const AUDIBLE_RMS = 1 / 128;  // one step of getByteTimeDomainData
     // Per-peer RMS stats for tuning visibility
     window.__nt_rms_stats = {}; // trackKey -> {sum, peak, count}
 
@@ -164,7 +165,11 @@ AUDIO_CAPTURE_INIT_JS = """
                 if (rms > stats.peak) stats.peak = rms;
                 stats.count += 1;
                 const speaking = rms > VAD_THRESHOLD;
-                if (speaking) window.__nt_lastVoiceAt = now;
+                // The silence alert asks "is this track alive", not "is
+                // someone talking": one 8-bit step of signal is enough. A
+                // dead subscription reads exactly zero; a quiet speaker
+                // rarely reaches VAD_THRESHOLD but is never at zero.
+                if (rms >= AUDIBLE_RMS) window.__nt_lastVoiceAt = now;
                 if (speaking) {
                     if (!peer.active) {
                         peer.active = true;
@@ -841,6 +846,11 @@ def _others_in_call(base_url: str, auth: tuple, room_token: str, own_user: str) 
     return True if presence is None else presence[1] > 0
 
 
+def _log_alert_failure(task: asyncio.Task) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        log.error("Silence alert failed: %s", task.exception())
+
+
 class AudioRecorder:
     """Records audio from a Nextcloud Talk call via Playwright.
 
@@ -877,6 +887,8 @@ class AudioRecorder:
     # others are in the call. 0 disables it.
     alert_fn = None
     silence_alert_s = 0
+    # Seconds the bot was in the call, set when the call ends.
+    in_call_s = None
 
     async def _join_call(self, page, rejoin: bool = False) -> None:
         """Click through Talk's join flow. Used for the first join and to
@@ -898,9 +910,9 @@ class AudioRecorder:
         dialog_join = page.locator(",".join(dialog_selectors))
         # Only a visible dialog: a hidden modal earlier in the DOM would be
         # .first and hide a real one.
-        open_dialog = page.locator(
-            ",".join(f"{sel} >> visible=true" for sel in dialog_selectors)
-        )
+        # Playwright splits on ">>" before ",", so the filter goes once, after
+        # the whole list; per-alternative filters can never match.
+        open_dialog = page.locator(",".join(dialog_selectors) + " >> visible=true")
         if rejoin and await open_dialog.first.is_visible():
             # A previous attempt opened the media-settings dialog and missed
             # it. The top-bar button is under its overlay now, so clicking
@@ -1205,6 +1217,7 @@ class AudioRecorder:
             silent_streak = 0
             joined_at = time.monotonic()
             silence_alerted = False
+            alert_tasks: set[asyncio.Task] = set()
             while True:
                 await asyncio.sleep(10)
                 poll_count += 1
@@ -1313,12 +1326,15 @@ class AudioRecorder:
                             room_token,
                             others_present,
                         )
-                        try:
-                            await asyncio.to_thread(
+                        # In the background: a slow or down mail server must
+                        # not stop presence polls, rejoins and flushes.
+                        task = asyncio.create_task(
+                            asyncio.to_thread(
                                 self.alert_fn, voice_ago, others_present, rejoins
                             )
-                        except Exception:
-                            log.exception("Silence alert failed")
+                        )
+                        alert_tasks.add(task)
+                        task.add_done_callback(_log_alert_failure)
                 elif voice_ago < self.silence_alert_s:
                     # Heard again: a later silence deserves its own alert.
                     silence_alerted = False
@@ -1350,6 +1366,11 @@ class AudioRecorder:
                             room_token,
                             empty_streak * 10,
                         )
+                        # Time actually in the call, without the join and the
+                        # grace period: the fallback length for verification.
+                        self.in_call_s = max(
+                            0.0, time.monotonic() - joined_at - empty_streak * 10
+                        )
                         break
                 else:
                     if empty_streak > 0:
@@ -1359,6 +1380,11 @@ class AudioRecorder:
                             empty_streak * 10,
                         )
                     empty_streak = 0
+
+            if alert_tasks:
+                # Let an alert still being sent finish, but never hold up the
+                # notes for long; a spooled alert retries on its own.
+                await asyncio.wait(alert_tasks, timeout=120)
 
             # Extract speaker timeline BEFORE closing the recorder/browser —
             # DOM and __nt_* state are still live here.

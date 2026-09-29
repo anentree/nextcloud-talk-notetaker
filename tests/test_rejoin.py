@@ -8,6 +8,7 @@ dead subscription. The loop only ever asked whether OTHER people were in the
 call, and skipped its own participant entry, so nothing noticed.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
@@ -302,3 +303,89 @@ async def test_a_failing_alert_does_not_stop_the_recording():
     alert = MagicMock(side_effect=RuntimeError("smtp down"))
     await _record_with_voice([here] * 3, [900] * 3, alert_fn=alert)
     alert.assert_called_once()
+
+
+def test_the_open_dialog_filter_applies_to_the_whole_list():
+    """Playwright splits on ">>" before ",": a filter per alternative parses
+    into a chain that can never match (the 2a83186 regression)."""
+    import asyncio as aio
+
+    recorder = _make_recorder()
+    page = MagicMock()
+    seen = []
+
+    def locator(selector):
+        seen.append(selector)
+        loc = MagicMock()
+        loc.first = AsyncMock()
+        loc.first.is_visible = AsyncMock(return_value=True)
+        return loc
+
+    page.locator = locator
+    aio.run(recorder._join_call(page, rejoin=True))
+    [open_dialog] = [sel for sel in seen if "visible=true" in sel]
+    assert open_dialog.count(">>") == 1
+    assert open_dialog.endswith(" >> visible=true")
+
+
+@pytest.mark.asyncio
+async def test_with_no_voice_ever_the_silence_is_counted_from_joining():
+    here = ({"neo"}, 1, True)
+    clock = iter([1000.0] + [1000.0 + 60 * i for i in range(1, 20)])
+    with patch("notetaker.recorder.time.monotonic", side_effect=lambda: next(clock)):
+        alert = await _record_with_voice([here] * 8, [None] * 8)
+    alert.assert_called_once()
+    assert alert.call_args.args[0] >= 300
+
+
+@pytest.mark.asyncio
+async def test_a_slow_alert_does_not_hold_up_the_polls():
+    import threading
+
+    here = ({"neo"}, 1, True)
+    release = threading.Event()
+    started = threading.Event()
+    finished = threading.Event()
+    polls = []
+    polled_during_alert = []
+
+    def slow_alert(*args):
+        started.set()
+        release.wait(5)
+        finished.set()
+
+    recorder, pw_ctx, join = _join_tracking_page()
+    recorder.silence_alert_s = 300
+    recorder.alert_fn = slow_alert
+    base = _evaluate_dispatcher()
+
+    async def evaluate(js, *a, **k):
+        if "voiceAgoS" in str(js):
+            return {"hasRecorder": True, "voiceAgoS": 900.0}
+        return await base(js, *a, **k)
+
+    join.page.evaluate = evaluate
+    seq = iter([here] * 5)
+
+    def presence(*a, **k):
+        polls.append(1)
+        if started.is_set() and not finished.is_set():
+            polled_during_alert.append(len(polls))
+        if len(polls) == 5:
+            release.set()
+        return next(seq, (set(), 0, True))
+
+    with (
+        patch("playwright.async_api.async_playwright", return_value=pw_ctx),
+        patch("notetaker.recorder._call_presence", side_effect=presence),
+    ):
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(_):
+            await real_sleep(0)
+
+        with patch("notetaker.recorder.asyncio.sleep", new=fast_sleep):
+            await recorder.record_call("abc123", "Talk")
+    # Polls kept running while the alert was still being sent.
+    assert polled_during_alert
+    assert finished.is_set()

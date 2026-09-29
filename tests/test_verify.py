@@ -380,12 +380,89 @@ def test_an_unreadable_length_falls_back_to_time_in_the_call(tmp_path):
     assert any("speech" in p for p in problems)
 
 
-def test_an_already_published_recording_is_not_held_on_retry(tmp_path):
+def test_a_recording_that_passed_once_is_not_rejudged(tmp_path):
     from notetaker.main import _verify_content
 
-    for done in ({"notes_saved": True}, {"email_done": True}):
-        meta = {"transcript": "[00:00] hi", "duration_s": 3600.0, **done}
-        assert _verify_content(_cfg(), meta, "/nope.webm", NOTES) == []
+    meta = {"transcript": "[00:00] hi", "duration_s": 3600.0, "verified": True}
+    assert _verify_content(_cfg(), meta, "/nope.webm", NOTES) == []
+
+
+def test_a_legacy_sidecar_with_email_done_is_still_verified(tmp_path):
+    """Retained before verification existed: its flags prove nothing about
+    the content, and publishing its notes now would repeat the incident."""
+    from notetaker.main import drain_retained
+
+    cfg = _pipeline_cfg(tmp_path)
+    os.makedirs(cfg.retained_audio_dir)
+    audio = os.path.join(cfg.retained_audio_dir, "itujzrjw-2026-09-20-talk.webm")
+    with open(audio, "wb") as f:
+        f.write(b"a")
+    legacy = {
+        "token": "itujzrjw",
+        "name": "Talk",
+        "call_start": "2026-09-20T17:00:00",
+        "participants": PARTICIPANTS,
+        "attendee_ids": ["brantley", "piyush"],
+        "notes": NOTES,
+        "transcript": "[00:12] Thanks for watching!",
+        "email_done": True,
+        "attempts": 1,
+        "next_attempt_at": 0,
+    }
+    retained._atomic_write(retained.sidecar_path(audio), legacy)
+    with (
+        patch("notetaker.transcriber._get_audio_duration", return_value=4680.0),
+        patch("notetaker.main.upload_notes") as upload,
+        patch("notetaker.transcripts.upload_notes"),
+        patch("notetaker.main.deliver_notes", return_value=True) as email,
+        patch("notetaker.retained.time.time", return_value=9e9),
+    ):
+        drain_retained(cfg)
+    upload.assert_not_called()
+    assert os.path.exists(audio)
+    [alert] = [c.args[1] for c in email.call_args_list]
+    assert [r["email"] for r in alert["recipients"]] == ["neo@x.com"]
+    assert "already saved or emailed" in alert["body"]
+
+
+def test_a_retry_that_turns_out_empty_is_held_in_place(tmp_path):
+    """A recording retained for an upload failure, whose content then fails:
+    held where it already is, not retained a second time."""
+    from notetaker.main import drain_retained
+
+    cfg = _pipeline_cfg(tmp_path)
+    os.makedirs(cfg.retained_audio_dir)
+    audio = os.path.join(cfg.retained_audio_dir, "itujzrjw-2026-09-29-talk.webm")
+    with open(audio, "wb") as f:
+        f.write(b"a")
+    meta = {
+        "token": "itujzrjw",
+        "name": "Talk",
+        "call_start": "2026-09-29T17:00:00",
+        "participants": PARTICIPANTS,
+        "attendee_ids": ["brantley", "piyush"],
+        "transcript": "[00:12] Thanks for watching!",
+        "attempts": 0,
+        "next_attempt_at": 0,
+    }
+    retained._atomic_write(retained.sidecar_path(audio), meta)
+    with (
+        patch("notetaker.transcriber._get_audio_duration", return_value=4680.0),
+        patch("notetaker.transcriber.summarize_transcript", return_value=NOTES),
+        patch("notetaker.main.upload_notes") as upload,
+        patch("notetaker.transcripts.upload_notes"),
+        patch("notetaker.main.deliver_notes", return_value=True),
+        patch("notetaker.retained.time.time", return_value=9e9),
+    ):
+        drain_retained(cfg)
+    upload.assert_not_called()
+    assert sorted(os.listdir(cfg.retained_audio_dir)) == [
+        "itujzrjw-2026-09-29-talk.webm",
+        "itujzrjw-2026-09-29-talk.webm.json",
+    ]
+    with open(retained.sidecar_path(audio), encoding="utf-8") as f:
+        sidecar = json.load(f)
+    assert sidecar["parked"] and sidecar["held"] and sidecar["alert_sent"]
 
 
 def test_gemini_segment_transcripts_are_checked(tmp_path):
@@ -482,3 +559,28 @@ def test_the_silence_alert_goes_to_the_alert_address_only(tmp_path):
     envelope = email.call_args.args[1]
     assert [r["email"] for r in envelope["recipients"]] == ["neo@x.com"]
     assert "7 minutes" in envelope["body"] and "NOT recording" in envelope["body"]
+
+
+def test_a_good_chunked_gemini_call_passes(tmp_path):
+    from notetaker.main import _verify_content
+    from notetaker.transcriber import make_notes
+
+    cfg = _cfg(transcription_backend="gemini")
+    meta = {}
+
+    def fake(*args, transcript_sink=None, **kwargs):
+        transcript_sink.extend([_speech(400, 15), _speech(400, 15)])
+        return NOTES
+
+    with patch("notetaker.transcriber.transcribe_and_summarize", side_effect=fake):
+        make_notes(cfg, meta, "/a.webm", "Talk", "2026-09-29")
+    meta["duration_s"] = 30 * 60.0
+    assert _verify_content(cfg, meta, "/a.webm", NOTES) == []
+
+
+def test_a_failed_retain_does_not_name_a_wrong_path(tmp_path):
+    cfg = _pipeline_cfg(tmp_path)
+    with patch("notetaker.retained.retain", side_effect=OSError("disk full")):
+        _, _, mocks = _run_call(cfg, tmp_path, SILENT)
+    body = mocks["email"].call_args_list[0].args[1]["body"]
+    assert "--release" not in body and "could not be moved" in body

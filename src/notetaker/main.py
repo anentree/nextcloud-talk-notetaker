@@ -190,7 +190,7 @@ async def handle_call(cfg: Config, room: dict) -> None:
         "participants": None,
         # How long the bot was in the call: the fallback length when the
         # recording itself cannot be measured.
-        "recorded_s": (datetime.now() - call_start).total_seconds(),
+        "recorded_s": _in_call_seconds(recorder, call_start),
     }
 
     # Everything from here on must leave the recording in a defined state:
@@ -207,6 +207,15 @@ async def handle_call(cfg: Config, room: dict) -> None:
             _retain_audio(cfg, audio_path, meta)
 
 
+def _in_call_seconds(recorder, call_start: datetime) -> float:
+    """The recorder's own measure (join to hang-up, without the grace period),
+    or wall-clock time since the call was picked up if it has none."""
+    measured = getattr(recorder, "in_call_s", None)
+    if isinstance(measured, (int, float)):
+        return float(measured)
+    return (datetime.now() - call_start).total_seconds()
+
+
 def _alert_silence(
     cfg: Config, token: str, name: str, silent_s: float, others: int, rejoins: int
 ) -> None:
@@ -215,11 +224,15 @@ def _alert_silence(
         {"token": token, "name": name},
         subject=f"Notetaker is not hearing the call: {name}",
         lines=[
-            f'{others} participant(s) are in the call "{name}" (room {token}), '
-            f"but the notetaker has heard nothing for {silent_s / 60:.0f} minutes.",
+            (
+                f'{others} participant(s) are in the call "{name}" (room {token}), '
+                f"but the notetaker has heard nothing for {silent_s / 60:.0f} minutes."
+            ),
             "",
-            "If people are talking, it is NOT recording them. Hang up and start "
-            "the call again; the notetaker joins the new call on its own.",
+            (
+                "If people are talking, it is NOT recording them. Hang up and start "
+                "the call again; the notetaker joins the new call on its own."
+            ),
             "",
             f"Rejoins it has already tried on its own this call: {rejoins}.",
         ],
@@ -357,6 +370,7 @@ def _finish_recording(
     problems = _verify_content(cfg, meta, audio_path, notes)
     if problems:
         return _hold_recording(cfg, meta, audio_path, filename, participants, problems)
+    meta["verified"] = True
 
     # 5. Save notes
     notes_saved = bool(meta.get("notes_saved"))
@@ -429,13 +443,9 @@ def _finish_recording(
 
 def _verify_content(cfg: Config, meta: dict, audio_path: str, notes: str) -> list[str]:
     """Why this call's output cannot be trusted, or [] if it can."""
-    if meta.get("content_accepted"):
-        # Released by hand with reprocess.py --release.
-        return []
-    if meta.get("notes_saved") or meta.get("email_done"):
-        # Already published by an earlier attempt (a recording retained
-        # before verification existed, or a threshold changed since). Holding
-        # it now would claim nothing went out when it did.
+    if meta.get("content_accepted") or meta.get("verified"):
+        # Released by hand with reprocess.py --release, or passed on an
+        # earlier attempt (a threshold changed since must not re-judge it).
         return []
     if "duration_s" not in meta:
         try:
@@ -486,13 +496,14 @@ def _hold_recording(
             held_path = retained.retain(cfg.retained_audio_dir, audio_path, meta)
         except Exception:
             log.exception("Could not retain the held recording %s", audio_path)
-    log.error("Held recording for room %s is at %s", token, held_path)
+            held_path = None  # handle_call retries under its own name
+    log.error("Held recording for room %s is at %s", token, held_path or audio_path)
 
     if meta.get("alert_sent"):
         return False
     call_start = datetime.fromisoformat(meta["call_start"])
     container_path = os.path.join(
-        "/data/notes/retained-audio", os.path.basename(held_path)
+        "/data/notes/retained-audio", os.path.basename(held_path or "")
     )
     _send_alert(
         cfg,
@@ -507,29 +518,45 @@ def _hold_recording(
             *[f"- {p}" for p in problems],
             "",
             (
-                "Nothing was emailed to the attendees and no notes were put in the "
-                "shared folder. The notes it produced are attached."
+                "An earlier attempt, from before this check existed, had already "
+                "saved or emailed these notes; nothing further was sent. The notes "
+                "are attached."
+                if meta.get("notes_saved") or meta.get("email_done")
+                else "Nothing was emailed to the attendees and no notes were put in "
+                "the shared folder. The notes it produced are attached."
             ),
             "",
             "Attendees: "
             + (", ".join(p["display_name"] for p in participants) or "unknown"),
             f"Room: {token}",
             "",
-            (
-                f"The recording is kept at notes/retained-audio/{os.path.basename(held_path)} "
-                "on the server until you release or delete it. If the call really "
-                "was this quiet, release it to the attendees with:"
-            ),
-            "",
-            (
-                "  docker compose exec notetaker python -m notetaker.reprocess "
-                f"--release {container_path}"
+            *(
+                [
+                    (
+                        "The recording is kept at notes/retained-audio/"
+                        f"{os.path.basename(held_path)} on the server until you "
+                        "release or delete it. If the call really was this quiet, "
+                        "release it to the attendees with:"
+                    ),
+                    "",
+                    (
+                        "  docker compose exec notetaker python -m notetaker.reprocess "
+                        f"--release {container_path}"
+                    ),
+                ]
+                if held_path
+                else [
+                    (
+                        "The recording could not be moved to notes/retained-audio; the "
+                        "notetaker log has where it is now."
+                    )
+                ]
             ),
         ],
         notes=meta.get("notes") or "",
         filename=filename,
     )
-    if held_path != audio_path and meta.get("alert_sent"):
+    if held_path and held_path != audio_path and meta.get("alert_sent"):
         # The sidecar was written before the alert; record that it went out.
         try:
             sidecar = retained.sidecar_path(held_path)
