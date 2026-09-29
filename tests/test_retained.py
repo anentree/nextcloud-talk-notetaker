@@ -20,6 +20,9 @@ import pytest
 
 from notetaker import retained
 from notetaker.config import Config
+from tests.notes_fixture import NOTES_BODY
+
+NOTES = "# Notes" + NOTES_BODY
 
 
 def _load(path):
@@ -407,7 +410,7 @@ def test_failed_call_is_retained_with_its_recipients_and_later_finished(
     # 2. Not due yet: nothing happens.
     mock_transcribe.reset_mock()
     mock_transcribe.side_effect = None
-    mock_transcribe.return_value = "# Notes\n\nSubject: hi\n\nbody"
+    mock_transcribe.return_value = "# Notes\n\nSubject: hi\n\nbody" + NOTES_BODY
     drain_retained(cfg)
     mock_upload.assert_not_called()
 
@@ -459,7 +462,7 @@ def test_retry_resolves_recipients_if_the_live_call_died_before_it_could(
     mock_recorder.record_call = AsyncMock(return_value=(str(audio), [], {"brantley"}))
     mock_recorder_cls.return_value = mock_recorder
     mock_participants.return_value = []  # Nextcloud down: the real contract
-    mock_transcribe.return_value = "# Notes"
+    mock_transcribe.return_value = NOTES
     mock_upload.side_effect = RuntimeError("Nextcloud 502")  # still down
 
     asyncio.run(
@@ -515,7 +518,7 @@ def test_retry_does_not_re_resolve_when_nobody_attended(
     mock_recorder.record_call = AsyncMock(return_value=(str(audio), [], set()))
     mock_recorder_cls.return_value = mock_recorder
     mock_participants.return_value = []
-    mock_transcribe.return_value = "# Notes"
+    mock_transcribe.return_value = NOTES
     mock_upload.side_effect = RuntimeError("Nextcloud 502")
 
     asyncio.run(
@@ -537,7 +540,7 @@ def test_retry_does_not_re_resolve_when_nobody_attended(
 @patch("notetaker.main.deliver_notes", return_value=True)
 @patch("notetaker.main.upload_notes", side_effect=RuntimeError("Nextcloud 502"))
 @patch("notetaker.main.get_participant_emails")
-@patch("notetaker.transcriber.transcribe_and_summarize", return_value="# Notes")
+@patch("notetaker.transcriber.transcribe_and_summarize", return_value=NOTES)
 @patch("notetaker.main.AudioRecorder")
 def test_retry_reuses_the_notes_and_does_not_email_twice(
     mock_recorder_cls,
@@ -573,7 +576,7 @@ def test_retry_reuses_the_notes_and_does_not_email_twice(
         cfg.retained_audio_dir, "itujzrjw-2026-09-08-accounting-talk.webm"
     )
     sidecar = _load(retained.sidecar_path(dest))
-    assert sidecar["notes"] == "# Notes"
+    assert sidecar["notes"] == NOTES
     assert sidecar["email_done"] is True
 
     # Still down at the first retry: nothing is redone, the sidecar keeps
@@ -583,7 +586,7 @@ def test_retry_reuses_the_notes_and_does_not_email_twice(
     assert mock_transcribe.call_count == 1
     assert mock_email.call_count == 1
     sidecar = _load(retained.sidecar_path(dest))
-    assert sidecar["notes"] == "# Notes" and sidecar["email_done"] is True
+    assert sidecar["notes"] == NOTES and sidecar["email_done"] is True
     assert sidecar["attempts"] == 1
 
     # Nextcloud back: one upload, nothing else, recording gone.
@@ -593,7 +596,7 @@ def test_retry_reuses_the_notes_and_does_not_email_twice(
         drain_retained(cfg)
 
     mock_upload.assert_called_once()
-    assert mock_upload.call_args.args[-1] == "# Notes"
+    assert mock_upload.call_args.args[-1] == NOTES
     assert mock_transcribe.call_count == 1
     assert mock_email.call_count == 1
     assert not os.path.exists(dest)
@@ -603,7 +606,7 @@ def test_retry_reuses_the_notes_and_does_not_email_twice(
 @patch("notetaker.main.deliver_notes", return_value=False)
 @patch("notetaker.main.upload_notes", side_effect=RuntimeError("Nextcloud 502"))
 @patch("notetaker.main.get_participant_emails")
-@patch("notetaker.transcriber.transcribe_and_summarize", return_value="# Notes")
+@patch("notetaker.transcriber.transcribe_and_summarize", return_value=NOTES)
 @patch("notetaker.main.AudioRecorder")
 def test_a_spooled_email_also_counts_as_done(
     mock_recorder_cls,

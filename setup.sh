@@ -555,6 +555,15 @@ LOCAL_NOTES_DIR=$LOCAL_NOTES_DIR
 # Same, for NOTES_STORAGE=local (keep it under /data/notes so it persists):
 # LOCAL_TRANSCRIPTS_DIR=/data/notes/transcripts
 
+# Before a recording is deleted, its output is checked (verify.py). A call
+# over VERIFY_MIN_MINUTES long whose transcript has fewer than
+# MIN_SPEECH_CHARS_PER_MINUTE characters of speech per minute, or whose notes
+# are empty, is HELD: the audio is kept, nothing is emailed or shared, and
+# ALERT_EMAIL is told. Release one by hand with reprocess.py --release.
+# MIN_SPEECH_CHARS_PER_MINUTE=30
+# VERIFY_MIN_MINUTES=5
+# ALERT_EMAIL=
+
 # Optional: user ID to always place last in note filenames
 FILENAME_LAST_USER=
 

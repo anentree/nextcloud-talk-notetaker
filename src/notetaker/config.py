@@ -79,6 +79,11 @@ class Config:
     # see — which is why it may not be the notes folder or inside it.
     transcripts_folder: str = ""
     local_transcripts_dir: str = ""
+    # Content verification before the recording is deleted (verify.py). A
+    # call that fails is held: audio kept, nobody emailed, ALERT_EMAIL told.
+    min_speech_chars_per_minute: int = 30
+    verify_min_minutes: int = 5
+    alert_email: str = ""
     email_overrides: dict[str, str] = field(default_factory=dict)
     mail_domain: str = ""
     # Email is on only when SMTP_HOST is present in the environment. The
@@ -164,6 +169,14 @@ class Config:
             problems.append("GEMINI_API_KEY is required unless NOTES_BACKEND=claude")
         if self.poll_interval < 1:
             problems.append("POLL_INTERVAL_SECONDS must be >= 1")
+        if self.min_speech_chars_per_minute < 0 or self.verify_min_minutes < 0:
+            problems.append(
+                "MIN_SPEECH_CHARS_PER_MINUTE and VERIFY_MIN_MINUTES must be >= 0"
+            )
+        if self.alert_email and "@" not in self.alert_email:
+            problems.append(
+                f"ALERT_EMAIL is not an email address: {self.alert_email!r}"
+            )
         return problems
 
     @property
@@ -333,6 +346,11 @@ class Config:
             local_notes_dir=os.getenv("LOCAL_NOTES_DIR", ""),
             transcripts_folder=os.getenv("TRANSCRIPTS_FOLDER", "").strip(),
             local_transcripts_dir=os.getenv("LOCAL_TRANSCRIPTS_DIR", "").strip(),
+            min_speech_chars_per_minute=int(
+                os.getenv("MIN_SPEECH_CHARS_PER_MINUTE", "30")
+            ),
+            verify_min_minutes=int(os.getenv("VERIFY_MIN_MINUTES", "5")),
+            alert_email=os.getenv("ALERT_EMAIL", "").strip(),
             email_overrides=_parse_email_overrides(os.getenv("EMAIL_OVERRIDES", "")),
             mail_domain=os.getenv("MAIL_DOMAIN", ""),
             email_enabled="SMTP_HOST" in os.environ,

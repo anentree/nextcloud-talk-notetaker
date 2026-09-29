@@ -121,6 +121,9 @@ All configuration is via environment variables in `.env`:
 | `LOCAL_NOTES_DIR`             | No       | —                          | Local directory for notes (when storage=local)                                 |
 | `TRANSCRIPTS_FOLDER`          | No       | —                          | Nextcloud folder for the verbatim Whisper transcript; never emailed; top-level, separate from `NOTES_FOLDER` |
 | `LOCAL_TRANSCRIPTS_DIR`       | No       | —                          | Local directory for transcripts (when storage=local)                           |
+| `ALERT_EMAIL`                 | No       | —                          | Who is told when a recording is held by content verification                   |
+| `MIN_SPEECH_CHARS_PER_MINUTE` | No       | `30`                       | Below this much transcribed speech per minute a call is held, not published    |
+| `VERIFY_MIN_MINUTES`          | No       | `5`                        | Shorter calls are not judged on speech (a test call can be silent)             |
 | `FILENAME_LAST_USER`          | No       | —                          | User ID always placed last in filenames                                        |
 | `POLL_INTERVAL_SECONDS`       | No       | `10`                       | Seconds between poll cycles                                                    |
 | `AUDIO_DIR`                   | No       | `/tmp/notetaker-audio`     | Temp directory for audio files                                                 |
@@ -151,6 +154,18 @@ Each call produces a markdown file with:
 - Follow-up email draft
 
 With `TRANSCRIPTS_FOLDER` set, a second file with the same name goes into that folder: the verbatim Whisper transcript, one `[MM:SS] Speaker: words` line per utterance. It is only written, never emailed. Calls whose notes came from the Gemini audio path (Gemini backend, or the fallback after repeated Whisper failures) have no verbatim transcript.
+
+## When a recording is deleted
+
+The recording is deleted only when the notes are saved, the transcript is saved (if `TRANSCRIPTS_FOLDER` is set), and the content passes a check: the notes are not empty, and a call longer than `VERIFY_MIN_MINUTES` has at least `MIN_SPEECH_CHARS_PER_MINUTE` characters of transcribed speech per minute. Real calls run several hundred; a call where the bot recorded silence runs near zero.
+
+A call that fails the check is **held**: nothing is emailed to the attendees, no notes go to the shared folder, the transcript still goes to its private folder, `ALERT_EMAIL` gets a message saying why with the notes attached, and the recording stays in `notes/retained-audio/` (it is never retried on its own, and is deleted after `RETAINED_AUDIO_MAX_AGE_DAYS`). If the call really was that quiet, release it:
+
+```bash
+docker compose exec notetaker python -m notetaker.reprocess --release /data/notes/retained-audio/<file>.webm
+```
+
+That saves the notes it already made, emails the attendees, and deletes the recording.
 
 ## Architecture Notes
 

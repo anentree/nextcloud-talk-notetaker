@@ -9,6 +9,7 @@ import pytest
 
 from notetaker import retained, transcripts
 from notetaker.config import Config
+from tests.notes_fixture import NOTES_BODY
 
 SEGMENTS = [
     {"start": 0.0, "end": 2.0, "text": "Hello there."},
@@ -18,7 +19,7 @@ TRANSCRIPT_LINES = [
     "[00:00] Hello there.",
     "[00:30] The budget is 4,200 dollars, not 4,000.",
 ]
-NOTES = "# Notes\n\nSubject: Recap\n\nbody"
+NOTES = "# Notes\n\nSubject: Recap\n\nbody" + NOTES_BODY
 PARTICIPANTS = [
     {"user_id": "brantley", "display_name": "Brantley Gunn", "email": "b@x.com"},
     {"user_id": "Jo", "display_name": "Jo", "email": "jo@y.com"},

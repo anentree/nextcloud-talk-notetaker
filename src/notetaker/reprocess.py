@@ -74,6 +74,46 @@ def _load_sidecar(audio_path: str) -> dict:
     return meta
 
 
+def release(cfg: Config, audio_path: str) -> int:
+    """Finish a held recording as if it had passed verification: the same
+    pipeline the live call would have run, with the notes it already made."""
+    from .main import _retry_recording
+
+    path = retained.sidecar_path(audio_path)
+    try:
+        with open(path, encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError) as exc:
+        log.error("No readable sidecar at %s: %s", path, exc)
+        return 1
+    if not meta.get("held"):
+        log.error(
+            "%s was not held by content verification; reprocess it without "
+            "--release instead",
+            audio_path,
+        )
+        return 1
+    log.info("Releasing %s, held because: %s", audio_path, "; ".join(meta["held"]))
+    meta.pop("parked", None)
+    meta["content_accepted"] = True
+    try:
+        ok = _retry_recording(cfg, meta, audio_path)
+    finally:
+        # Whatever happened, keep what was learned (notes_saved, email_done)
+        # so running this again cannot email the attendees twice.
+        retained._atomic_write(path, meta)
+    if not ok:
+        log.error("Released, but the notes or transcript could not be saved; kept")
+        return 1
+    for leftover in (audio_path, path):
+        try:
+            os.unlink(leftover)
+        except OSError:
+            log.warning("Could not remove %s", leftover)
+    log.info("Released and delivered; the recording is deleted")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("audio_path", help="path to the retained .webm recording")
@@ -95,6 +135,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="transcribe and print to stdout without saving anywhere",
     )
+    parser.add_argument(
+        "--release",
+        action="store_true",
+        help=(
+            "a recording HELD by content verification: accept its output as it "
+            "is, then save the notes, email the attendees and delete the audio"
+        ),
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -106,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     cfg = Config.from_env()
+    if args.release:
+        return release(cfg, args.audio_path)
     token, call_date, parsed_name = parse_retained_name(args.audio_path)
     name = args.name or parsed_name
     participants = [p.strip() for p in args.participants.split(",") if p.strip()]

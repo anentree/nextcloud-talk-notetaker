@@ -3,6 +3,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 from notetaker.main import handle_call, _build_notes_filename
 from notetaker.config import Config
 from datetime import datetime
+from tests.notes_fixture import NOTES_BODY
 
 
 @patch("notetaker.main.os.unlink")
@@ -27,7 +28,9 @@ def test_handle_call_pipeline(
     )
     mock_recorder_cls.return_value = mock_recorder
 
-    mock_transcribe.return_value = "# Meeting: Standup\n\n## Summary\nGood stuff."
+    mock_transcribe.return_value = (
+        "# Meeting: Standup\n\n## Summary\nGood stuff." + NOTES_BODY
+    )
     mock_participants.return_value = [
         {"user_id": "alice", "display_name": "Alice", "email": "alice@example.com"},
     ]
@@ -143,7 +146,9 @@ def test_handle_call_does_not_email_when_email_is_disabled(
         return_value=("/tmp/audio.wav", [], {"alice"})
     )
     mock_recorder_cls.return_value = mock_recorder
-    mock_transcribe.return_value = "# Meeting: Standup\n\n## Summary\nGood stuff."
+    mock_transcribe.return_value = (
+        "# Meeting: Standup\n\n## Summary\nGood stuff." + NOTES_BODY
+    )
     mock_participants.return_value = [
         {"user_id": "alice", "display_name": "Alice", "email": "alice@example.com"},
     ]
@@ -187,7 +192,10 @@ def test_finish_recording_dates_the_notes_by_the_call_not_the_retry(tmp_path):
     audio = tmp_path / "a.webm"
     audio.write_bytes(b"x")
     with (
-        patch("notetaker.transcriber.transcribe_and_summarize", return_value="# N") as tr,
+        patch(
+            "notetaker.transcriber.transcribe_and_summarize",
+            return_value="# N" + NOTES_BODY,
+        ) as tr,
         patch("notetaker.main.deliver_notes", return_value=True),
     ):
         assert _finish_recording(cfg, meta, str(audio), []) is True

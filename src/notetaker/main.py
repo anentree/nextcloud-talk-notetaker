@@ -9,7 +9,7 @@ import sys
 import time
 from datetime import datetime
 
-from notetaker import retained, spool, transcripts
+from notetaker import retained, spool, transcriber, transcripts, verify
 from notetaker.config import Config
 from notetaker.mailer import extract_follow_up_email, send_notes_email
 from notetaker.monitor import CallMonitor
@@ -304,6 +304,14 @@ def _finish_recording(
         meta["notes"] = notes
     _touch_heartbeat(cfg)
 
+    # 4b. Check the content before anything is published or deleted. Saving
+    # a file proves nothing: on 2026-09-29 a call that recorded only silence
+    # produced tidy notes about nothing, which were saved, emailed to an
+    # outside attendee, and the recording deleted.
+    problems = _verify_content(cfg, meta, audio_path, notes)
+    if problems:
+        return _hold_recording(cfg, meta, filename, participants, problems)
+
     # 5. Save notes
     notes_saved = bool(meta.get("notes_saved"))
     if notes_saved:
@@ -371,6 +379,98 @@ def _finish_recording(
     # the recording too: its sidecar holds the transcript, so the retry only
     # redoes the upload.
     return notes_saved and transcript_saved
+
+
+def _verify_content(cfg: Config, meta: dict, audio_path: str, notes: str) -> list[str]:
+    """Why this call's output cannot be trusted, or [] if it can."""
+    if meta.get("content_accepted"):
+        # Released by hand with reprocess.py --release.
+        return []
+    if "duration_s" not in meta:
+        try:
+            meta["duration_s"] = transcriber._get_audio_duration(audio_path)
+        except Exception:
+            # Unknown length: verify.py skips the speech check rather than guess.
+            log.warning("Could not read the length of %s", audio_path, exc_info=True)
+            meta["duration_s"] = None
+    return verify.check_content(
+        cfg, notes, meta.get("transcript"), meta["duration_s"], NO_SPEECH_SENTINEL
+    )
+
+
+def _hold_recording(
+    cfg: Config,
+    meta: dict,
+    filename: str,
+    participants: list[dict],
+    problems: list[str],
+) -> bool:
+    """Keep a recording whose output failed verification. Nothing reaches the
+    attendees: no notes in the shared folder, no email. The transcript goes to
+    its private folder for review, ALERT_EMAIL is told, and the recording is
+    parked — kept, never retried on its own — until someone releases it with
+    reprocess.py --release or the retention window deletes it."""
+    token = meta.get("token", "unknown")
+    meta["parked"] = True
+    meta["held"] = problems
+    log.error(
+        "Recording for room %s FAILED content verification and is held for "
+        "review; nothing was emailed or shared: %s",
+        token,
+        "; ".join(problems),
+    )
+    _save_transcript(cfg, meta, filename, participants)
+    if meta.get("alert_sent"):
+        return False
+    if not (cfg.alert_email and cfg.email_enabled):
+        log.error("ALERT_EMAIL is not set; nobody was told about the held recording")
+        return False
+    call_start = datetime.fromisoformat(meta["call_start"])
+    lines = [
+        (
+            f'The notetaker held the recording of "{meta.get("name", token)}" '
+            f"({call_start:%Y-%m-%d %H:%M}) because its output failed verification:"
+        ),
+        "",
+        *[f"- {p}" for p in problems],
+        "",
+        (
+            "Nothing was emailed to the attendees and no notes were put in the "
+            "shared folder. The notes it produced are attached."
+        ),
+        "",
+        f"Attendees: {', '.join(p['display_name'] for p in participants) or 'unknown'}",
+        f"Room: {token}",
+        "",
+        (
+            "The recording is kept in the retained-audio folder (notes/retained-audio "
+            f"on the server, a file starting with {token}-) for "
+            f"{cfg.retained_audio_max_age_days} days. If the call really was this "
+            "quiet, release it to the attendees with:"
+        ),
+        "",
+        (
+            "  docker compose exec notetaker python -m notetaker.reprocess --release "
+            f"/data/notes/retained-audio/{token}-<file>.webm"
+        ),
+    ]
+    deliver_notes(
+        cfg,
+        {
+            "room": token,
+            "room_name": meta.get("name", token),
+            "recipients": [
+                {"user_id": "", "display_name": "", "email": cfg.alert_email}
+            ],
+            "subject": f"Notetaker held a recording: {meta.get('name', token)}",
+            "body": "\n".join(lines),
+            "notes": meta.get("notes") or "",
+            "filename": filename,
+        },
+    )
+    # Sent or spooled; either way a later pass must not send it again.
+    meta["alert_sent"] = True
+    return False
 
 
 def _save_notes(cfg: Config, filename: str, notes: str) -> None:
@@ -444,6 +544,15 @@ def _retain_audio(cfg: Config, audio_path: str, meta: dict) -> None:
     token = meta.get("token", "unknown")
     try:
         dest = retained.retain(cfg.retained_audio_dir, audio_path, meta)
+        if meta.get("parked"):
+            log.error(
+                "Recording for room %s held at %s; it is not retried on its "
+                "own. Release it with: python -m notetaker.reprocess --release %s",
+                token,
+                dest,
+                dest,
+            )
+            return
         log.error(
             "Notes or transcript could not be saved for room %s — recording retained at %s; "
             "it will be retried automatically (first try in %d min)",
