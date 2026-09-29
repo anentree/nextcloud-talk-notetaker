@@ -13,6 +13,7 @@ to start, which both `docker ps` and the weekly health probe already notice.
 from __future__ import annotations
 
 import logging
+import re
 import smtplib
 
 import requests
@@ -84,6 +85,13 @@ def check_notes_target(cfg: Config) -> None:
         raise RuntimeError(f"WebDAV PROPFIND returned {resp.status_code}")
 
 
+TRANSCRIPTS_PROPFIND_BODY = (
+    '<?xml version="1.0"?><d:propfind xmlns:d="DAV:" '
+    'xmlns:oc="http://owncloud.org/ns"><d:prop><oc:permissions/></d:prop>'
+    "</d:propfind>"
+)
+
+
 def check_transcripts_target(cfg: Config) -> None:
     """Confirm the private transcript folder exists and is reachable. Found
     missing here, it is a clear message at boot; found missing at the end of
@@ -106,7 +114,8 @@ def check_transcripts_target(cfg: Config) -> None:
         "PROPFIND",
         f"{cfg.nextcloud_url}/remote.php/dav/files/{cfg.nextcloud_user}/{folder}",
         auth=(cfg.nextcloud_user, cfg.nextcloud_password),
-        headers={"Depth": "0"},
+        headers={"Depth": "0", "Content-Type": "application/xml"},
+        data=TRANSCRIPTS_PROPFIND_BODY,
         timeout=15,
     )
     if resp.status_code == 404:
@@ -118,6 +127,15 @@ def check_transcripts_target(cfg: Config) -> None:
     if resp.status_code not in (207, 200):
         raise RuntimeError(
             f"WebDAV PROPFIND on TRANSCRIPTS_FOLDER returned {resp.status_code}"
+        )
+    # A read-only share passes the existence test, then fails every upload
+    # and keeps every call's audio for 30 days. "C" = may create files.
+    match = re.search(r"<oc:permissions>([A-Z]*)</oc:permissions>", resp.text or "")
+    if match and "C" not in match.group(1):
+        raise RuntimeError(
+            f"TRANSCRIPTS_FOLDER {cfg.transcripts_folder} is read-only for "
+            f"{cfg.nextcloud_user} (permissions {match.group(1)!r}); share it "
+            "with edit rights"
         )
 
 

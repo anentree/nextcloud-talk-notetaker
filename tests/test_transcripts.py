@@ -106,6 +106,10 @@ def test_document_omits_attendees_when_unknown():
         "/meeting-notes%2Fprivate",
         "/meeting-notes\\private",
         "/meeting-notes/private?x",
+        "/private\x01",
+        "/meeting-notes /x",
+        "/meeting-notes\u200b/x",
+        "/meeting-notes./x",
         "/",
     ],
 )
@@ -406,6 +410,88 @@ def test_a_retry_keeps_the_name_the_first_file_was_stored_under(
     assert whisper_pipeline["notes_upload"].call_args.args[4] == transcript_name
 
 
+def test_a_transcript_retry_uses_the_name_the_notes_were_saved_under(
+    tmp_path, whisper_pipeline
+):
+    """Notes saved, transcript upload failed; the retry resolves different
+    participants. The transcript must still take the summary's name."""
+    from notetaker.main import drain_retained
+
+    cfg = _cfg(tmp_path)
+    audio = _audio(tmp_path)
+    whisper_pipeline["transcript_upload"].side_effect = RuntimeError("502")
+    with patch("notetaker.main.AudioRecorder", return_value=_recorder(audio)):
+        _run_call(cfg)
+    notes_name = whisper_pipeline["notes_upload"].call_args.args[4]
+
+    whisper_pipeline["transcript_upload"].side_effect = None
+    with (
+        patch("notetaker.retained.time.time", return_value=9e9),
+        patch(
+            "notetaker.main.get_participant_emails",
+            return_value=[
+                {"user_id": "zed", "display_name": "Zed", "email": "z@x.com"}
+            ],
+        ),
+    ):
+        # Force the retry to look the recipients up again.
+        dest = _dest(cfg)
+        with open(retained.sidecar_path(dest), encoding="utf-8") as f:
+            sidecar = json.load(f)
+        sidecar["participants"] = None
+        with open(retained.sidecar_path(dest), "w", encoding="utf-8") as f:
+            json.dump(sidecar, f)
+        drain_retained(cfg)
+
+    assert whisper_pipeline["transcript_upload"].call_args.args[4] == notes_name
+
+
+def test_a_failed_lookup_does_not_pin_an_unknown_name_when_notes_fail(
+    tmp_path, whisper_pipeline
+):
+    """Recipient lookup failed AND the notes step failed: the transcript waits
+    for the retry, which resolves real names for both files."""
+    from notetaker.main import drain_retained
+
+    cfg = _cfg(tmp_path)
+    audio = _audio(tmp_path)
+    with (
+        patch("notetaker.main.get_participant_emails", return_value=[]),
+        patch(
+            "notetaker.transcriber.summarize_transcript",
+            side_effect=RuntimeError("quota"),
+        ),
+        patch("notetaker.main.AudioRecorder", return_value=_recorder(audio)),
+        pytest.raises(RuntimeError),
+    ):
+        _run_call(cfg)
+    whisper_pipeline["transcript_upload"].assert_not_called()
+
+    with patch("notetaker.retained.time.time", return_value=9e9):
+        drain_retained(cfg)
+
+    name = whisper_pipeline["transcript_upload"].call_args.args[4]
+    assert name == whisper_pipeline["notes_upload"].call_args.args[4]
+    assert name.endswith("-brantley-jo.md")
+
+
+def test_a_broken_transcript_save_never_hides_the_notes_error(
+    tmp_path, whisper_pipeline
+):
+    cfg = _cfg(tmp_path)
+    audio = _audio(tmp_path)
+    with (
+        patch(
+            "notetaker.transcriber.summarize_transcript",
+            side_effect=RuntimeError("quota"),
+        ),
+        patch("notetaker.main._save_transcript", side_effect=KeyError("boom")),
+        patch("notetaker.main.AudioRecorder", return_value=_recorder(audio)),
+        pytest.raises(RuntimeError, match="quota"),
+    ):
+        _run_call(cfg)
+
+
 def test_the_email_goes_out_before_the_transcript_upload(tmp_path, whisper_pipeline):
     order = []
     whisper_pipeline["email"].side_effect = lambda *a, **k: order.append("email")
@@ -599,6 +685,7 @@ def test_reprocess_refuses_an_unsafe_transcripts_folder(tmp_path, monkeypatch):
 def _propfind(status):
     resp = MagicMock()
     resp.status_code = status
+    resp.text = ""
     return resp
 
 
@@ -616,6 +703,34 @@ def test_preflight_fails_when_the_transcripts_folder_is_missing(tmp_path):
     ) as req:
         check_transcripts_target(cfg)
     assert req.call_args.args[1].endswith("/files/bot/meeting-notes-transcriptions")
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_preflight_fails_on_any_other_webdav_error(tmp_path, status):
+    from notetaker.preflight import check_transcripts_target
+
+    with (
+        patch("notetaker.preflight.requests.request", return_value=_propfind(status)),
+        pytest.raises(RuntimeError, match=str(status)),
+    ):
+        check_transcripts_target(_cfg(tmp_path))
+
+
+def test_preflight_fails_on_a_read_only_share(tmp_path):
+    from notetaker.preflight import check_transcripts_target
+
+    resp = _propfind(207)
+    resp.text = "<d:multistatus><oc:permissions>SG</oc:permissions></d:multistatus>"
+    with (
+        patch("notetaker.preflight.requests.request", return_value=resp),
+        pytest.raises(RuntimeError, match="read-only"),
+    ):
+        check_transcripts_target(_cfg(tmp_path))
+    resp.text = (
+        "<d:multistatus><oc:permissions>SGDNVCK</oc:permissions></d:multistatus>"
+    )
+    with patch("notetaker.preflight.requests.request", return_value=resp):
+        check_transcripts_target(_cfg(tmp_path))
 
 
 def test_preflight_runs_the_transcripts_check_only_when_enabled(tmp_path):

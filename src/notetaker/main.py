@@ -290,8 +290,16 @@ def _finish_recording(
         except Exception:
             # Whisper may have finished before the notes step failed. Store
             # the transcript now rather than leave it only in a sidecar that
-            # the 30-day prune deletes if the notes never come right.
-            _save_transcript(cfg, meta, filename, participants)
+            # the 30-day prune deletes if the notes never come right. Not
+            # when the recipient lookup failed: that would pin an "-unknown"
+            # filename the retry could otherwise fix.
+            lookup_failed = not participants and meta.get("attendee_ids")
+            if meta.get("transcript") is not None and not lookup_failed:
+                try:
+                    _save_transcript(cfg, meta, filename, participants)
+                except Exception:
+                    # Never let this replace the error that got us here.
+                    log.exception("Could not save the transcript for room %s", token)
             raise
         meta["notes"] = notes
     _touch_heartbeat(cfg)
@@ -397,7 +405,7 @@ def _save_transcript(
         log.info(
             "No verbatim transcript for room %s (%s); nothing to save",
             meta.get("token"),
-            "no speech" if transcript else "notes came from the Gemini audio path",
+            "no speech" if transcript else "none was produced for this recording",
         )
         return True
     document = transcripts.build_document(

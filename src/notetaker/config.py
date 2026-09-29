@@ -26,8 +26,13 @@ def _path_parts(path: str) -> list[str]:
 
 
 # A Nextcloud folder name with any of these can reach the server as a
-# different path than the one compared here (%2F decodes to a slash).
-_UNSAFE_FOLDER_CHARS = re.compile(r"[%\\?#\x00-\x1f\x7f]")
+# different path than the one compared here (%2F decodes to a slash), or
+# look identical to another name: zero-width characters, and whitespace or a
+# dot at either end of a segment.
+_UNSAFE_FOLDER_CHARS = re.compile(
+    r"[%\\?#\x00-\x1f\x7f\u200b-\u200f\u2028-\u202f\u2060\ufeff]"
+    r"|(^|/)\s|\s($|/)|\.($|/)"
+)
 
 
 def _parse_email_overrides(raw: str) -> dict[str, str]:
