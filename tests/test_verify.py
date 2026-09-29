@@ -471,3 +471,14 @@ def test_a_failed_release_is_left_for_the_automatic_retry(tmp_path, monkeypatch)
 )
 def test_bad_verification_settings_are_refused(overrides):
     assert _cfg(**overrides).validate()
+
+
+def test_the_silence_alert_goes_to_the_alert_address_only(tmp_path):
+    from notetaker.main import _alert_silence
+
+    cfg = _pipeline_cfg(tmp_path, smtp_host="host.docker.internal")
+    with patch("notetaker.main.deliver_notes", return_value=True) as email:
+        _alert_silence(cfg, "itujzrjw", "Accounting Talk", 420.0, 2, 1)
+    envelope = email.call_args.args[1]
+    assert [r["email"] for r in envelope["recipients"]] == ["neo@x.com"]
+    assert "7 minutes" in envelope["body"] and "NOT recording" in envelope["body"]

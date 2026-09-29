@@ -84,6 +84,7 @@ def _join_tracking_page():
 
     page.locator = locator
     page.evaluate = _evaluate_dispatcher()
+    join.page = page
     return recorder, pw_ctx, join
 
 
@@ -203,8 +204,10 @@ async def test_a_rejoin_never_clicks_start_call():
     assert all("Start call" in sel for sel in first)  # the check can see it
     assert len(rejoin) == 2
     assert all("Start call" not in sel for sel in rejoin)
-    assert "Start call" in join.dialog.selectors[0]
-    assert all("Start call" not in sel for sel in join.dialog.selectors[1:])
+    # Each join builds an open-dialog locator and a dialog locator.
+    assert all("Start call" in sel for sel in join.dialog.selectors[:2])
+    assert len(join.dialog.selectors) == 4
+    assert all("Start call" not in sel for sel in join.dialog.selectors[2:])
 
 
 @pytest.mark.asyncio
@@ -232,3 +235,70 @@ async def test_a_dialog_left_open_is_clicked_instead_of_the_covered_button():
     join = await _record([dropped, dropped, ({"neo"}, 1, True)], setup=dialog_left_open)
     assert join.first.click.await_count == 1  # the first join only
     assert join.dialog.first.click.await_count == 1
+
+
+# --- telling a human while the call can still be saved ------------------------
+
+
+async def _record_with_voice(presence, voice_ago, silence_alert_s=300, alert_fn=None):
+    recorder, pw_ctx, join = _join_tracking_page()
+    recorder.silence_alert_s = silence_alert_s
+    recorder.alert_fn = alert_fn or MagicMock()
+    base = _evaluate_dispatcher()
+    ago = iter(voice_ago)
+
+    async def evaluate(js, *a, **k):
+        if "voiceAgoS" in str(js):
+            return {"hasRecorder": True, "voiceAgoS": next(ago, 0.0)}
+        return await base(js, *a, **k)
+
+    join.page.evaluate = evaluate
+    seq = iter(presence)
+    with (
+        patch("playwright.async_api.async_playwright", return_value=pw_ctx),
+        patch(
+            "notetaker.recorder._call_presence",
+            side_effect=lambda *a, **k: next(seq, (set(), 0, True)),
+        ),
+        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
+    ):
+        await recorder.record_call("abc123", "Accounting Talk")
+    return recorder.alert_fn
+
+
+@pytest.mark.asyncio
+async def test_a_long_silence_with_people_in_the_call_alerts_once():
+    here = ({"neo", "piyush"}, 2, True)
+    alert = await _record_with_voice([here] * 6, [0, 100, 200, 301, 400, 500])
+    alert.assert_called_once()
+    silent_s, others, rejoins = alert.call_args.args
+    assert silent_s == 301 and others == 2 and rejoins == 0
+
+
+@pytest.mark.asyncio
+async def test_a_new_silence_after_voice_alerts_again():
+    here = ({"neo"}, 1, True)
+    alert = await _record_with_voice([here] * 6, [301, 400, 5, 10, 320, 330])
+    assert alert.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_no_alert_when_nobody_else_is_in_the_call():
+    alone = (set(), 0, True)
+    alert = await _record_with_voice([alone] * 6, [900] * 6)
+    alert.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_silence_alert_can_be_turned_off():
+    here = ({"neo"}, 1, True)
+    alert = await _record_with_voice([here] * 4, [900] * 4, silence_alert_s=0)
+    alert.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_alert_does_not_stop_the_recording():
+    here = ({"neo"}, 1, True)
+    alert = MagicMock(side_effect=RuntimeError("smtp down"))
+    await _record_with_voice([here] * 3, [900] * 3, alert_fn=alert)
+    alert.assert_called_once()

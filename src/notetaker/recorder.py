@@ -5,6 +5,7 @@ import base64
 import logging
 import os
 import re
+import time
 from datetime import date
 
 import requests
@@ -163,6 +164,7 @@ AUDIO_CAPTURE_INIT_JS = """
                 if (rms > stats.peak) stats.peak = rms;
                 stats.count += 1;
                 const speaking = rms > VAD_THRESHOLD;
+                if (speaking) window.__nt_lastVoiceAt = now;
                 if (speaking) {
                     if (!peer.active) {
                         peer.active = true;
@@ -457,6 +459,8 @@ AUDIO_STATUS_JS = """() => ({
         .reduce((n, pc) => n + pc.getReceivers().filter(r => r.track &&
             r.track.kind === 'audio' && r.track.readyState === 'live' &&
             !r.track.muted).length, 0),
+    voiceAgoS: window.__nt_lastVoiceAt
+        ? (performance.now() - window.__nt_lastVoiceAt) / 1000 : null,
 })"""
 
 # JavaScript to flush accumulated audio chunks as base64 and clear the buffer.
@@ -868,6 +872,11 @@ class AudioRecorder:
 
     # Set by the caller so the recorder can prove liveness during a long call.
     heartbeat_fn = None
+    # Set by the caller: alert_fn(silent_seconds, others_in_call, rejoins) is
+    # called once per stretch of silence_alert_s with nobody heard while
+    # others are in the call. 0 disables it.
+    alert_fn = None
+    silence_alert_s = 0
 
     async def _join_call(self, page, rejoin: bool = False) -> None:
         """Click through Talk's join flow. Used for the first join and to
@@ -881,22 +890,22 @@ class AudioRecorder:
         # Click the actual "Join call" button inside the dialog
         # (audio/video are already muted at the getUserMedia level)
         dialog_texts = ("Join call",) if rejoin else ("Join call", "Start call")
-        dialog_join = page.locator(
-            ",".join(
-                f'{scope} button:has-text("{text}")'
-                for scope in (".media-settings", ".modal-container")
-                for text in dialog_texts
-            )
-            + ","
-            + ",".join(
-                f'[class*="call-button"]:has-text("{text}")' for text in dialog_texts
-            )
+        dialog_selectors = [
+            f'{scope} button:has-text("{text}")'
+            for scope in (".media-settings", ".modal-container")
+            for text in dialog_texts
+        ] + [f'[class*="call-button"]:has-text("{text}")' for text in dialog_texts]
+        dialog_join = page.locator(",".join(dialog_selectors))
+        # Only a visible dialog: a hidden modal earlier in the DOM would be
+        # .first and hide a real one.
+        open_dialog = page.locator(
+            ",".join(f"{sel} >> visible=true" for sel in dialog_selectors)
         )
-        if rejoin and await dialog_join.first.is_visible():
+        if rejoin and await open_dialog.first.is_visible():
             # A previous attempt opened the media-settings dialog and missed
             # it. The top-bar button is under its overlay now, so clicking
             # that would time out on every attempt for the rest of the call.
-            await dialog_join.first.click()
+            await open_dialog.first.click()
             log.info("Clicked the Join call button of an already open dialog")
             return
 
@@ -1194,6 +1203,8 @@ class AudioRecorder:
             dropped_streak = 0
             rejoins = 0
             silent_streak = 0
+            joined_at = time.monotonic()
+            silence_alerted = False
             while True:
                 await asyncio.sleep(10)
                 poll_count += 1
@@ -1281,6 +1292,37 @@ class AudioRecorder:
                 # remote track reliably when its RTP stops is unproven, and a
                 # false alarm would make the bot leave and rejoin mid-call.
                 # verify.py holds a recording that came out silent.
+                # Nobody heard for a long stretch while people are in the
+                # call: tell a human NOW, while the call can still be saved.
+                # On 2026-09-29 the first sign of a dead recording was notes
+                # about nothing, 78 minutes after it could have been fixed.
+                voice_ago = diag.get("voiceAgoS")
+                if voice_ago is None:
+                    voice_ago = time.monotonic() - joined_at
+                if (
+                    self.silence_alert_s
+                    and others_present
+                    and voice_ago >= self.silence_alert_s
+                ):
+                    if not silence_alerted and self.alert_fn is not None:
+                        silence_alerted = True
+                        log.warning(
+                            "No audio heard for %.0f min in room %s while %d "
+                            "other(s) are in the call; alerting",
+                            voice_ago / 60,
+                            room_token,
+                            others_present,
+                        )
+                        try:
+                            await asyncio.to_thread(
+                                self.alert_fn, voice_ago, others_present, rejoins
+                            )
+                        except Exception:
+                            log.exception("Silence alert failed")
+                elif voice_ago < self.silence_alert_s:
+                    # Heard again: a later silence deserves its own alert.
+                    silence_alerted = False
+
                 if others_present and self_in_call and live_audio == 0:
                     silent_streak += 1
                     if silent_streak == 6:

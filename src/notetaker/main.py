@@ -170,6 +170,10 @@ async def handle_call(cfg: Config, room: dict) -> None:
     # A call blocks the outer poll loop, so the recorder keeps the heartbeat
     # fresh on our behalf.
     recorder.heartbeat_fn = lambda: _touch_heartbeat(cfg)
+    recorder.silence_alert_s = cfg.silence_alert_minutes * 60
+    recorder.alert_fn = lambda silent_s, others, rejoins: _alert_silence(
+        cfg, token, name, silent_s, others, rejoins
+    )
     audio_path, speaker_events, attendee_ids = await recorder.record_call(token, name)
     log.info("Captured %d speaker events for room '%s'", len(speaker_events), name)
 
@@ -201,6 +205,27 @@ async def handle_call(cfg: Config, room: dict) -> None:
             _discard_audio(audio_path)
         elif os.path.exists(audio_path):
             _retain_audio(cfg, audio_path, meta)
+
+
+def _alert_silence(
+    cfg: Config, token: str, name: str, silent_s: float, others: int, rejoins: int
+) -> None:
+    _send_alert(
+        cfg,
+        {"token": token, "name": name},
+        subject=f"Notetaker is not hearing the call: {name}",
+        lines=[
+            f'{others} participant(s) are in the call "{name}" (room {token}), '
+            f"but the notetaker has heard nothing for {silent_s / 60:.0f} minutes.",
+            "",
+            "If people are talking, it is NOT recording them. Hang up and start "
+            "the call again; the notetaker joins the new call on its own.",
+            "",
+            f"Rejoins it has already tried on its own this call: {rejoins}.",
+        ],
+        notes="",
+        filename="alert.md",
+    )
 
 
 def _resolve_participants(cfg: Config, token: str, attendee_ids: set) -> list[dict]:
