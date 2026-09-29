@@ -9,7 +9,7 @@ import sys
 import time
 from datetime import datetime
 
-from notetaker import retained, spool
+from notetaker import retained, spool, transcripts
 from notetaker.config import Config
 from notetaker.mailer import extract_follow_up_email, send_notes_email
 from notetaker.monitor import CallMonitor
@@ -17,7 +17,7 @@ from notetaker.participants import get_participant_emails
 from notetaker.preflight import run_preflight
 from notetaker.recorder import AudioRecorder
 from notetaker.storage import upload_notes
-from notetaker.transcriber import make_notes
+from notetaker.transcriber import NO_SPEECH_SENTINEL, make_notes
 
 log = logging.getLogger(__name__)
 
@@ -286,28 +286,22 @@ def _finish_recording(
     filename = _build_notes_filename(
         participants, call_start, last_user=cfg.filename_last_user
     )
-    notes_saved = False
-    try:
-        if cfg.notes_storage == "local" and cfg.local_notes_dir:
-            os.makedirs(cfg.local_notes_dir, exist_ok=True)
-            local_path = os.path.join(cfg.local_notes_dir, filename)
-            with open(local_path, "w", encoding="utf-8") as f:
-                f.write(notes)
-            log.info("Saved notes locally to %s", local_path)
-        else:
-            upload_notes(
-                cfg.nextcloud_url,
-                cfg.nextcloud_user,
-                cfg.nextcloud_password,
-                cfg.notes_folder,
-                filename,
-                notes,
-            )
-        notes_saved = True
-    except Exception:
-        # Keep going: the email below is now the ONLY copy of these notes,
-        # which makes delivering it more important, not less.
-        log.exception("Failed to save notes for room %s", token)
+    notes_saved = bool(meta.get("notes_saved"))
+    if notes_saved:
+        # A retry for the transcript alone; the notes are already stored.
+        log.info("Notes for room %s were saved by an earlier attempt", token)
+    else:
+        try:
+            _save_notes(cfg, filename, notes)
+            notes_saved = True
+            meta["notes_saved"] = True
+        except Exception:
+            # Keep going: the email below is now the ONLY copy of these notes,
+            # which makes delivering it more important, not less.
+            log.exception("Failed to save notes for room %s", token)
+
+    # 5b. Save the word-for-word transcript — privately, never emailed
+    transcript_saved = _save_transcript(cfg, meta, filename, participants)
 
     # 6. Email participants (retried, then spooled — never dropped)
     if not cfg.email_enabled:
@@ -343,15 +337,71 @@ def _finish_recording(
         delivered = False
 
     log.info(
-        "Done processing call in room '%s' (notes_saved=%s, email_delivered=%s)",
+        "Done processing call in room '%s' (notes_saved=%s, transcript_saved=%s, "
+        "email_delivered=%s)",
         name,
         notes_saved,
+        transcript_saved,
         delivered,
     )
     # The caller decides what to do with the audio based on this. Deleting the
     # recording at the exact moment the pipeline is known to be broken is how
-    # the 2026-08-13 calls became unrecoverable.
-    return notes_saved
+    # the 2026-08-13 calls became unrecoverable. An unsaved transcript keeps
+    # the recording too: its sidecar holds the transcript, so the retry only
+    # redoes the upload.
+    return notes_saved and transcript_saved
+
+
+def _save_notes(cfg: Config, filename: str, notes: str) -> None:
+    if cfg.notes_storage == "local" and cfg.local_notes_dir:
+        os.makedirs(cfg.local_notes_dir, exist_ok=True)
+        local_path = os.path.join(cfg.local_notes_dir, filename)
+        with open(local_path, "w", encoding="utf-8") as f:
+            f.write(notes)
+        log.info("Saved notes locally to %s", local_path)
+    else:
+        upload_notes(
+            cfg.nextcloud_url,
+            cfg.nextcloud_user,
+            cfg.nextcloud_password,
+            cfg.notes_folder,
+            filename,
+            notes,
+        )
+
+
+def _save_transcript(
+    cfg: Config, meta: dict, filename: str, participants: list[dict]
+) -> bool:
+    """Store the verbatim transcript in its private folder. Returns False only
+    when there is a transcript to keep and it could not be stored."""
+    transcript = meta.get("transcript")
+    if not cfg.transcripts_enabled:
+        return True
+    if meta.get("transcript_saved"):
+        return True
+    if not transcript or transcript == NO_SPEECH_SENTINEL:
+        log.info(
+            "No verbatim transcript for room %s (%s); nothing to save",
+            meta.get("token"),
+            "no speech" if transcript else "notes came from the Gemini audio path",
+        )
+        return True
+    document = transcripts.build_document(
+        transcript,
+        meta.get("name", meta.get("token", "")),
+        datetime.fromisoformat(meta["call_start"]).strftime("%Y-%m-%d %H:%M"),
+        # Without observed attendees the recipients are the room's members,
+        # and a member list is not evidence anyone was on the call.
+        [p["display_name"] for p in participants] if meta.get("attendee_ids") else None,
+    )
+    try:
+        transcripts.save(cfg, filename, document)
+    except Exception:
+        log.exception("Failed to save the transcript for room %s", meta.get("token"))
+        return False
+    meta["transcript_saved"] = True
+    return True
 
 
 def _discard_audio(audio_path: str) -> None:
@@ -373,7 +423,7 @@ def _retain_audio(cfg: Config, audio_path: str, meta: dict) -> None:
     try:
         dest = retained.retain(cfg.retained_audio_dir, audio_path, meta)
         log.error(
-            "Notes could not be saved for room %s — recording retained at %s; "
+            "Notes or transcript could not be saved for room %s — recording retained at %s; "
             "it will be retried automatically (first try in %d min)",
             token,
             dest,

@@ -15,6 +15,13 @@ def _normalise(value: str | None) -> str:
     return (value or "").strip().lower()
 
 
+def _path_parts(path: str) -> list[str]:
+    """Folder path as comparable segments. Casefolded so a near-miss like
+    /Meeting-Notes/x is still caught as inside /meeting-notes."""
+    normalised = os.path.normpath("/" + (path or "").strip()).replace("\\", "/")
+    return [p.casefold() for p in normalised.split("/") if p]
+
+
 def _parse_email_overrides(raw: str) -> dict[str, str]:
     """Parse 'user1=email1,user2=email2' into a dict."""
     overrides = {}
@@ -54,6 +61,11 @@ class Config:
     filename_last_user: str = ""
     notes_storage: str = "nextcloud"
     local_notes_dir: str = ""
+    # Where the word-for-word transcript goes. Empty means it is not kept.
+    # It is never emailed, so this folder must not be one the attendees can
+    # see — which is why it may not be the notes folder or inside it.
+    transcripts_folder: str = ""
+    local_transcripts_dir: str = ""
     email_overrides: dict[str, str] = field(default_factory=dict)
     mail_domain: str = ""
     # Email is on only when SMTP_HOST is present in the environment. The
@@ -110,6 +122,7 @@ class Config:
             )
         if self.notes_storage == "local" and not self.local_notes_dir:
             problems.append("NOTES_STORAGE=local requires LOCAL_NOTES_DIR")
+        problems.extend(self._validate_transcripts())
         if self.auth_method not in ("nextcloud", "yunohost"):
             problems.append(
                 f"AUTH_METHOD must be 'nextcloud' or 'yunohost' (got {self.auth_method!r})"
@@ -139,6 +152,52 @@ class Config:
         if self.poll_interval < 1:
             problems.append("POLL_INTERVAL_SECONDS must be >= 1")
         return problems
+
+    @property
+    def transcripts_enabled(self) -> bool:
+        if self.notes_storage == "local":
+            return bool(self.local_transcripts_dir)
+        return bool(self.transcripts_folder)
+
+    def _validate_transcripts(self) -> list[str]:
+        """In Nextcloud the notes folder is shared with the attendees, so the
+        transcript must never land in it, directly or in a subfolder. A local
+        notes directory is shared with nobody; there it only needs to differ,
+        or a transcript would overwrite the notes of the same name."""
+        if self.notes_storage == "local":
+            if not self.local_transcripts_dir:
+                return []
+            if _path_parts(self.local_transcripts_dir) == _path_parts(
+                self.local_notes_dir
+            ):
+                return [
+                    (
+                        "LOCAL_TRANSCRIPTS_DIR must differ from LOCAL_NOTES_DIR "
+                        f"(both are {self.local_notes_dir!r})"
+                    )
+                ]
+            return []
+
+        if not self.transcripts_folder:
+            return []
+        notes_parts = _path_parts(self.notes_folder)
+        transcripts_parts = _path_parts(self.transcripts_folder)
+        if not transcripts_parts:
+            return [
+                (
+                    "TRANSCRIPTS_FOLDER must name a folder, not the root "
+                    f"(got {self.transcripts_folder!r})"
+                )
+            ]
+        if transcripts_parts[: len(notes_parts)] == notes_parts:
+            return [
+                (
+                    f"TRANSCRIPTS_FOLDER ({self.transcripts_folder}) must not be "
+                    f"NOTES_FOLDER ({self.notes_folder}) or inside it: the notes "
+                    "folder is shared with the attendees and transcripts are private"
+                )
+            ]
+        return []
 
     def _validate_smtp(self) -> list[str]:
         """SMTP checks; only meaningful when email is enabled."""
@@ -200,6 +259,8 @@ class Config:
             filename_last_user=os.getenv("FILENAME_LAST_USER", ""),
             notes_storage=os.getenv("NOTES_STORAGE", "nextcloud"),
             local_notes_dir=os.getenv("LOCAL_NOTES_DIR", ""),
+            transcripts_folder=os.getenv("TRANSCRIPTS_FOLDER", "").strip(),
+            local_transcripts_dir=os.getenv("LOCAL_TRANSCRIPTS_DIR", "").strip(),
             email_overrides=_parse_email_overrides(os.getenv("EMAIL_OVERRIDES", "")),
             mail_domain=os.getenv("MAIL_DOMAIN", ""),
             email_enabled="SMTP_HOST" in os.environ,

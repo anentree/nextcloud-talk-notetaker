@@ -546,6 +546,14 @@ NOTES_FOLDER=$NOTES_FOLDER
 # docker-compose.yml mounts the notes/ folder beside it here; nothing else persists across restarts.
 LOCAL_NOTES_DIR=$LOCAL_NOTES_DIR
 
+# Optional: keep the word-for-word Whisper transcript of every call as well.
+# It is never emailed. Use a folder the attendees cannot see: it may not be
+# NOTES_FOLDER or inside it, since that folder is usually shared with them.
+# Empty or unset = transcripts are not kept.
+# TRANSCRIPTS_FOLDER=/meeting-notes-transcriptions
+# Same, for NOTES_STORAGE=local (keep it under /data/notes so it persists):
+# LOCAL_TRANSCRIPTS_DIR=/data/notes/transcripts
+
 # Optional: user ID to always place last in note filenames
 FILENAME_LAST_USER=
 

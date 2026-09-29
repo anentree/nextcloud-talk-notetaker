@@ -29,10 +29,10 @@ import os
 import re
 import sys
 
-from . import retained
+from . import retained, transcripts
 from .config import Config
 from .storage import upload_notes
-from .transcriber import make_notes
+from .transcriber import NO_SPEECH_SENTINEL, make_notes
 
 log = logging.getLogger("notetaker.reprocess")
 
@@ -134,10 +134,27 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(notes)
         return 0
 
+    transcript = meta.get("transcript")
+    if transcript == NO_SPEECH_SENTINEL:
+        transcript = None
+    document = (
+        transcripts.build_document(
+            transcript, name, call_date or "undated", participants or None
+        )
+        if transcript
+        else None
+    )
+
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(notes)
         log.info("Wrote notes to %s", args.out)
+        if document:
+            stem, ext = os.path.splitext(args.out)
+            out = f"{stem}-transcript{ext or '.md'}"
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(document)
+            log.info("Wrote the transcript to %s", out)
         return 0
 
     filename = f"{call_date or 'undated'}-{token or 'recovered'}-recovered.md"
@@ -150,6 +167,8 @@ def main(argv: list[str] | None = None) -> int:
         notes,
     )
     log.info("Uploaded recovered notes as %s/%s", cfg.notes_folder, filename)
+    if document and cfg.transcripts_enabled:
+        transcripts.save(cfg, filename, document)
     return 0
 
 
