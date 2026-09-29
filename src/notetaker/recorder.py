@@ -846,9 +846,58 @@ def _others_in_call(base_url: str, auth: tuple, room_token: str, own_user: str) 
     return True if presence is None else presence[1] > 0
 
 
-def _log_alert_failure(task: asyncio.Task) -> None:
-    if not task.cancelled() and task.exception() is not None:
-        log.error("Silence alert failed: %s", task.exception())
+CHAT_PATH = "/ocs/v2.php/apps/spreed/api/v1/chat/{token}"
+
+SILENCE_MESSAGE = (
+    "⚠️ AI Notetaker: I have heard NO audio for {minutes} minutes. If you are "
+    "talking, I am NOT recording you. Hang up and start the call again and I "
+    "will rejoin. Reply to this chat (anything) to make me stop asking."
+)
+SILENCE_ACK_MESSAGE = "AI Notetaker: OK, I will stop asking about the silence."
+
+
+def _post_chat(base_url: str, auth: tuple, room_token: str, message: str) -> int:
+    """Post to the call's chat. Returns the new message's id."""
+    resp = requests.post(
+        base_url + CHAT_PATH.format(token=room_token),
+        auth=auth,
+        headers=OCS_HEADERS,
+        data={"message": message},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return int(resp.json()["ocs"]["data"]["id"])
+
+
+def _someone_replied(
+    base_url: str, auth: tuple, room_token: str, own_user: str, after_id: int
+) -> bool:
+    """True once a person has written anything in the chat after ``after_id``.
+    Reads without moving the bot's read marker or waiting for new messages."""
+    resp = requests.get(
+        base_url + CHAT_PATH.format(token=room_token),
+        auth=auth,
+        headers=OCS_HEADERS,
+        params={
+            "lookIntoFuture": 1,
+            "lastKnownMessageId": after_id,
+            "timeout": 0,
+            "limit": 100,
+            "setReadMarker": 0,
+            "noStatusUpdate": 1,
+            "markNotificationsAsRead": 0,
+        },
+        timeout=10,
+    )
+    if resp.status_code == 304:
+        return False
+    resp.raise_for_status()
+    return any(
+        m.get("actorId") != own_user
+        and m.get("messageType", "comment") == "comment"
+        and not m.get("systemMessage")
+        for m in resp.json()["ocs"]["data"]
+    )
 
 
 class AudioRecorder:
@@ -882,11 +931,11 @@ class AudioRecorder:
 
     # Set by the caller so the recorder can prove liveness during a long call.
     heartbeat_fn = None
-    # Set by the caller: alert_fn(silent_seconds, others_in_call, rejoins) is
-    # called once per stretch of silence_alert_s with nobody heard while
-    # others are in the call. 0 disables it.
-    alert_fn = None
+    # Set by the caller: after silence_alert_s with nobody heard while others
+    # are in the call, the bot says so in the call's chat, every
+    # silence_repeat_s, until someone replies there. 0 disables it.
     silence_alert_s = 0
+    silence_repeat_s = 60
     # Seconds the bot was in the call, set when the call ends.
     in_call_s = None
 
@@ -1216,8 +1265,12 @@ class AudioRecorder:
             rejoins = 0
             silent_streak = 0
             joined_at = time.monotonic()
-            silence_alerted = False
-            alert_tasks: set[asyncio.Task] = set()
+            # One silence episode: the first warning's id (replies are looked
+            # for after it), when the last one went out, and whether someone
+            # answered. Reset when anyone is heard again.
+            warned_first_id = None
+            warned_last_at = None
+            silence_acknowledged = False
             while True:
                 await asyncio.sleep(10)
                 poll_count += 1
@@ -1306,7 +1359,7 @@ class AudioRecorder:
                 # false alarm would make the bot leave and rejoin mid-call.
                 # verify.py holds a recording that came out silent.
                 # Nobody heard for a long stretch while people are in the
-                # call: tell a human NOW, while the call can still be saved.
+                # call: tell them NOW, while the call can still be saved.
                 # On 2026-09-29 the first sign of a dead recording was notes
                 # about nothing, 78 minutes after it could have been fixed.
                 voice_ago = diag.get("voiceAgoS")
@@ -1316,28 +1369,64 @@ class AudioRecorder:
                     self.silence_alert_s
                     and others_present
                     and voice_ago >= self.silence_alert_s
+                    and not silence_acknowledged
                 ):
-                    if not silence_alerted and self.alert_fn is not None:
-                        silence_alerted = True
-                        log.warning(
-                            "No audio heard for %.0f min in room %s while %d "
-                            "other(s) are in the call; alerting",
-                            voice_ago / 60,
+                    # In the call's own chat, repeated until answered: the
+                    # people who can fix it are looking at the call, not at
+                    # their email.
+                    try:
+                        if warned_first_id is not None and _someone_replied(
+                            self.nextcloud_url,
+                            auth,
                             room_token,
-                            others_present,
-                        )
-                        # In the background: a slow or down mail server must
-                        # not stop presence polls, rejoins and flushes.
-                        task = asyncio.create_task(
-                            asyncio.to_thread(
-                                self.alert_fn, voice_ago, others_present, rejoins
+                            self.user,
+                            warned_first_id,
+                        ):
+                            silence_acknowledged = True
+                            log.info(
+                                "Silence warning acknowledged in the chat of room %s",
+                                room_token,
                             )
+                            _post_chat(
+                                self.nextcloud_url,
+                                auth,
+                                room_token,
+                                SILENCE_ACK_MESSAGE,
+                            )
+                        elif (
+                            warned_last_at is None
+                            or time.monotonic() - warned_last_at
+                            >= self.silence_repeat_s
+                        ):
+                            message_id = _post_chat(
+                                self.nextcloud_url,
+                                auth,
+                                room_token,
+                                SILENCE_MESSAGE.format(minutes=int(voice_ago // 60)),
+                            )
+                            warned_last_at = time.monotonic()
+                            if warned_first_id is None:
+                                warned_first_id = message_id
+                            log.warning(
+                                "No audio heard for %.0f min in room %s while %d "
+                                "other(s) are in the call; warned in the chat",
+                                voice_ago / 60,
+                                room_token,
+                                others_present,
+                            )
+                    except Exception as exc:  # noqa: BLE001 — keep recording
+                        log.warning(
+                            "Could not use the chat of room %s for the silence "
+                            "warning: %s: %s",
+                            room_token,
+                            type(exc).__name__,
+                            exc,
                         )
-                        alert_tasks.add(task)
-                        task.add_done_callback(_log_alert_failure)
-                elif voice_ago < self.silence_alert_s:
-                    # Heard again: a later silence deserves its own alert.
-                    silence_alerted = False
+                elif self.silence_alert_s and voice_ago < self.silence_alert_s:
+                    # Heard again: a later silence is a new episode.
+                    warned_first_id = None
+                    warned_last_at = None
+                    silence_acknowledged = False
 
                 if others_present and self_in_call and live_audio == 0:
                     silent_streak += 1
@@ -1380,11 +1469,6 @@ class AudioRecorder:
                             empty_streak * 10,
                         )
                     empty_streak = 0
-
-            if alert_tasks:
-                # Let an alert still being sent finish, but never hold up the
-                # notes for long; a spooled alert retries on its own.
-                await asyncio.wait(alert_tasks, timeout=120)
 
             # Extract speaker timeline BEFORE closing the recorder/browser —
             # DOM and __nt_* state are still live here.

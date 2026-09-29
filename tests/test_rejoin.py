@@ -8,7 +8,6 @@ dead subscription. The loop only ever asked whether OTHER people were in the
 call, and skipped its own participant entry, so nothing noticed.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
@@ -238,73 +237,6 @@ async def test_a_dialog_left_open_is_clicked_instead_of_the_covered_button():
     assert join.dialog.first.click.await_count == 1
 
 
-# --- telling a human while the call can still be saved ------------------------
-
-
-async def _record_with_voice(presence, voice_ago, silence_alert_s=300, alert_fn=None):
-    recorder, pw_ctx, join = _join_tracking_page()
-    recorder.silence_alert_s = silence_alert_s
-    recorder.alert_fn = alert_fn or MagicMock()
-    base = _evaluate_dispatcher()
-    ago = iter(voice_ago)
-
-    async def evaluate(js, *a, **k):
-        if "voiceAgoS" in str(js):
-            return {"hasRecorder": True, "voiceAgoS": next(ago, 0.0)}
-        return await base(js, *a, **k)
-
-    join.page.evaluate = evaluate
-    seq = iter(presence)
-    with (
-        patch("playwright.async_api.async_playwright", return_value=pw_ctx),
-        patch(
-            "notetaker.recorder._call_presence",
-            side_effect=lambda *a, **k: next(seq, (set(), 0, True)),
-        ),
-        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
-    ):
-        await recorder.record_call("abc123", "Accounting Talk")
-    return recorder.alert_fn
-
-
-@pytest.mark.asyncio
-async def test_a_long_silence_with_people_in_the_call_alerts_once():
-    here = ({"neo", "piyush"}, 2, True)
-    alert = await _record_with_voice([here] * 6, [0, 100, 200, 301, 400, 500])
-    alert.assert_called_once()
-    silent_s, others, rejoins = alert.call_args.args
-    assert silent_s == 301 and others == 2 and rejoins == 0
-
-
-@pytest.mark.asyncio
-async def test_a_new_silence_after_voice_alerts_again():
-    here = ({"neo"}, 1, True)
-    alert = await _record_with_voice([here] * 6, [301, 400, 5, 10, 320, 330])
-    assert alert.call_count == 2
-
-
-@pytest.mark.asyncio
-async def test_no_alert_when_nobody_else_is_in_the_call():
-    alone = (set(), 0, True)
-    alert = await _record_with_voice([alone] * 6, [900] * 6)
-    alert.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_the_silence_alert_can_be_turned_off():
-    here = ({"neo"}, 1, True)
-    alert = await _record_with_voice([here] * 4, [900] * 4, silence_alert_s=0)
-    alert.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_a_failing_alert_does_not_stop_the_recording():
-    here = ({"neo"}, 1, True)
-    alert = MagicMock(side_effect=RuntimeError("smtp down"))
-    await _record_with_voice([here] * 3, [900] * 3, alert_fn=alert)
-    alert.assert_called_once()
-
-
 def test_the_open_dialog_filter_applies_to_the_whole_list():
     """Playwright splits on ">>" before ",": a filter per alternative parses
     into a chain that can never match (the 2a83186 regression)."""
@@ -326,69 +258,6 @@ def test_the_open_dialog_filter_applies_to_the_whole_list():
     [open_dialog] = [sel for sel in seen if "visible=true" in sel]
     assert open_dialog.count(">>") == 1
     assert open_dialog.endswith(" >> visible=true")
-
-
-@pytest.mark.asyncio
-async def test_with_no_voice_ever_the_silence_is_counted_from_joining():
-    here = ({"neo"}, 1, True)
-    clock = iter([1000.0] + [1000.0 + 60 * i for i in range(1, 20)])
-    with patch("notetaker.recorder.time.monotonic", side_effect=lambda: next(clock)):
-        alert = await _record_with_voice([here] * 8, [None] * 8)
-    alert.assert_called_once()
-    assert alert.call_args.args[0] >= 300
-
-
-@pytest.mark.asyncio
-async def test_a_slow_alert_does_not_hold_up_the_polls():
-    import threading
-
-    here = ({"neo"}, 1, True)
-    release = threading.Event()
-    started = threading.Event()
-    finished = threading.Event()
-    polls = []
-    polled_during_alert = []
-
-    def slow_alert(*args):
-        started.set()
-        release.wait(5)
-        finished.set()
-
-    recorder, pw_ctx, join = _join_tracking_page()
-    recorder.silence_alert_s = 300
-    recorder.alert_fn = slow_alert
-    base = _evaluate_dispatcher()
-
-    async def evaluate(js, *a, **k):
-        if "voiceAgoS" in str(js):
-            return {"hasRecorder": True, "voiceAgoS": 900.0}
-        return await base(js, *a, **k)
-
-    join.page.evaluate = evaluate
-    seq = iter([here] * 5)
-
-    def presence(*a, **k):
-        polls.append(1)
-        if started.is_set() and not finished.is_set():
-            polled_during_alert.append(len(polls))
-        if len(polls) == 5:
-            release.set()
-        return next(seq, (set(), 0, True))
-
-    with (
-        patch("playwright.async_api.async_playwright", return_value=pw_ctx),
-        patch("notetaker.recorder._call_presence", side_effect=presence),
-    ):
-        real_sleep = asyncio.sleep
-
-        async def fast_sleep(_):
-            await real_sleep(0)
-
-        with patch("notetaker.recorder.asyncio.sleep", new=fast_sleep):
-            await recorder.record_call("abc123", "Talk")
-    # Polls kept running while the alert was still being sent.
-    assert polled_during_alert
-    assert finished.is_set()
 
 
 @pytest.mark.asyncio
@@ -443,3 +312,186 @@ async def test_the_recorder_measures_its_time_in_the_call():
     # Joined at 1000; the grace period (60s) is not counted.
     assert recorder.in_call_s is not None
     assert recorder.in_call_s < 100
+
+
+# --- the silence warning, in the call's own chat -------------------------------
+
+
+class _Clock:
+    """monotonic() that moves only when the recorder sleeps."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    async def sleep(self, seconds):
+        self.now += seconds
+
+
+async def _record_with_chat(
+    presence, voice_ago, replied=None, silence_alert_s=300, post_error=None
+):
+    """Run a call; returns (post mock, replied mock). ``voice_ago`` is the
+    page's voiceAgoS per poll; ``replied`` answers each reply check."""
+    recorder, pw_ctx, join = _join_tracking_page()
+    recorder.silence_alert_s = silence_alert_s
+    recorder.silence_repeat_s = 60
+    base = _evaluate_dispatcher()
+    ago = iter(voice_ago)
+
+    async def evaluate(js, *a, **k):
+        if "voiceAgoS" in str(js):
+            return {"hasRecorder": True, "voiceAgoS": next(ago, 0.0)}
+        return await base(js, *a, **k)
+
+    join.page.evaluate = evaluate
+    seq = iter(presence)
+    ids = iter(range(500, 600))
+    post = MagicMock(side_effect=post_error or (lambda *a: next(ids)))
+    answers = iter(replied or [])
+    reply = MagicMock(side_effect=lambda *a: next(answers, False))
+    clock = _Clock()
+    with (
+        patch("playwright.async_api.async_playwright", return_value=pw_ctx),
+        patch(
+            "notetaker.recorder._call_presence",
+            side_effect=lambda *a, **k: next(seq, (set(), 0, True)),
+        ),
+        patch("notetaker.recorder.asyncio.sleep", new=clock.sleep),
+        patch("notetaker.recorder.time.monotonic", new=clock.monotonic),
+        patch("notetaker.recorder._post_chat", new=post),
+        patch("notetaker.recorder._someone_replied", new=reply),
+    ):
+        await recorder.record_call("abc123", "Accounting Talk")
+    return post, reply
+
+
+def _warnings(post):
+    from notetaker.recorder import SILENCE_ACK_MESSAGE
+
+    return [c.args[3] for c in post.call_args_list if c.args[3] != SILENCE_ACK_MESSAGE]
+
+
+@pytest.mark.asyncio
+async def test_a_long_silence_is_announced_in_the_chat_every_minute():
+    here = ({"neo", "piyush"}, 2, True)
+    post, _ = await _record_with_chat([here] * 13, [301 + 10 * i for i in range(13)])
+    warnings = _warnings(post)
+    # Polls are 10s apart: a warning on the first silent poll, then one per
+    # minute — polls 1, 7 and 13.
+    assert len(warnings) == 3
+    assert "NOT recording" in warnings[0] and "Reply" in warnings[0]
+    assert post.call_args_list[0].args[2] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_a_reply_in_the_chat_stops_the_warnings():
+    from notetaker.recorder import SILENCE_ACK_MESSAGE
+
+    here = ({"neo"}, 1, True)
+    # Reply checks run on polls 2..: the third one sees a reply.
+    post, reply = await _record_with_chat(
+        [here] * 20, [400] * 20, replied=[False, False, True]
+    )
+    assert len(_warnings(post)) == 1
+    assert post.call_args_list[-1].args[3] == SILENCE_ACK_MESSAGE
+    # Replies are looked for after the FIRST warning of the episode.
+    assert all(c.args[4] == 500 for c in reply.call_args_list)
+    assert reply.call_count == 3  # no more checks once acknowledged
+
+
+@pytest.mark.asyncio
+async def test_hearing_someone_again_starts_a_new_episode():
+    here = ({"neo"}, 1, True)
+    voice = [400, 5, 400]
+    post, reply = await _record_with_chat(
+        [here] * 3, voice, replied=[True, False, False]
+    )
+    # Poll 1 warns (id 500). Poll 2 hears someone: reset, no reply check.
+    # Poll 3 is a new episode: a fresh warning, not the old acknowledgement.
+    assert len(_warnings(post)) == 2
+    reply.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_no_warning_when_nobody_else_is_in_the_call():
+    alone = (set(), 0, True)
+    post, _ = await _record_with_chat([alone] * 6, [900] * 6)
+    post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_warning_can_be_turned_off():
+    here = ({"neo"}, 1, True)
+    post, _ = await _record_with_chat([here] * 4, [900] * 4, silence_alert_s=0)
+    post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_chat_failure_does_not_stop_the_recording_and_is_retried():
+    here = ({"neo"}, 1, True)
+    post, _ = await _record_with_chat(
+        [here] * 3, [400] * 3, post_error=[RuntimeError("503"), 501, 502]
+    )
+    assert post.call_count >= 2  # tried again on the next poll
+
+
+@pytest.mark.asyncio
+async def test_with_no_voice_ever_the_silence_is_counted_from_joining():
+    here = ({"neo"}, 1, True)
+    post, _ = await _record_with_chat([here] * 40, [None] * 40)
+    warnings = _warnings(post)
+    assert warnings
+    assert "for 5 minutes" in warnings[0]
+
+
+@responses.activate
+def test_post_chat_sends_the_message_and_returns_its_id():
+    from notetaker.recorder import _post_chat
+
+    url = f"{NEXTCLOUD_URL}/ocs/v2.php/apps/spreed/api/v1/chat/abc123"
+    responses.post(url, json={"ocs": {"data": {"id": 777}}}, status=201)
+    assert _post_chat(NEXTCLOUD_URL, ("bot", "s"), "abc123", "hello") == 777
+    assert responses.calls[0].request.body == "message=hello"
+
+
+@pytest.mark.parametrize(
+    "messages,expected",
+    [
+        ([], False),
+        ([{"actorId": "bot", "messageType": "comment", "systemMessage": ""}], False),
+        (
+            [{"actorId": "neo", "messageType": "system", "systemMessage": "call_left"}],
+            False,
+        ),
+        ([{"actorId": "neo", "messageType": "comment", "systemMessage": ""}], True),
+    ],
+)
+@responses.activate
+def test_someone_replied_counts_only_a_person_writing(messages, expected):
+    from notetaker.recorder import _someone_replied
+
+    url = f"{NEXTCLOUD_URL}/ocs/v2.php/apps/spreed/api/v1/chat/abc123"
+    responses.get(url, json={"ocs": {"data": messages}})
+    assert (
+        _someone_replied(NEXTCLOUD_URL, ("bot", "s"), "abc123", "bot", 500) is expected
+    )
+    query = responses.calls[0].request.url
+    for part in (
+        "lookIntoFuture=1",
+        "lastKnownMessageId=500",
+        "setReadMarker=0",
+        "timeout=0",
+    ):
+        assert part in query
+
+
+@responses.activate
+def test_someone_replied_is_false_when_nothing_is_new():
+    from notetaker.recorder import _someone_replied
+
+    url = f"{NEXTCLOUD_URL}/ocs/v2.php/apps/spreed/api/v1/chat/abc123"
+    responses.get(url, status=304)
+    assert _someone_replied(NEXTCLOUD_URL, ("bot", "s"), "abc123", "bot", 500) is False

@@ -565,10 +565,12 @@ LOCAL_NOTES_DIR=$LOCAL_NOTES_DIR
 # MIN_SPEECH_CHARS_PER_MINUTE=30
 # VERIFY_MIN_MINUTES=5
 # ALERT_EMAIL=
-# During a call: email ALERT_EMAIL when nobody has been heard for this many
-# minutes while others are in the call, so a dead recording can be fixed
-# while the call is still going. 0 turns it off.
+# During a call: when nobody has been heard for this many minutes while
+# others are in the call, the bot warns in the call's own chat, again every
+# SILENCE_ALERT_REPEAT_MINUTES, until someone replies there — so a dead
+# recording is fixed while the call is still going. 0 turns it off.
 # SILENCE_ALERT_MINUTES=5
+# SILENCE_ALERT_REPEAT_MINUTES=1
 
 # Optional: user ID to always place last in note filenames
 FILENAME_LAST_USER=

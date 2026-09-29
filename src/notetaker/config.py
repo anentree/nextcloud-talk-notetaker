@@ -84,9 +84,11 @@ class Config:
     min_speech_chars_per_minute: int = 30
     verify_min_minutes: int = 5
     alert_email: str = ""
-    # Mid-call: email ALERT_EMAIL when nobody has been heard for this long
-    # while others are in the call. 0 turns it off.
+    # Mid-call: after this long with nobody heard while others are in the
+    # call, warn in the call's chat, every silence_alert_repeat_minutes,
+    # until someone replies there. 0 turns it off.
     silence_alert_minutes: int = 5
+    silence_alert_repeat_minutes: int = 1
     email_overrides: dict[str, str] = field(default_factory=dict)
     mail_domain: str = ""
     # Email is on only when SMTP_HOST is present in the environment. The
@@ -181,6 +183,8 @@ class Config:
                 "MIN_SPEECH_CHARS_PER_MINUTE, VERIFY_MIN_MINUTES and "
                 "SILENCE_ALERT_MINUTES must be >= 0"
             )
+        if self.silence_alert_repeat_minutes < 1:
+            problems.append("SILENCE_ALERT_REPEAT_MINUTES must be >= 1")
         if self.alert_email and "@" not in self.alert_email:
             problems.append(
                 f"ALERT_EMAIL is not an email address: {self.alert_email!r}"
@@ -360,6 +364,9 @@ class Config:
             verify_min_minutes=int(os.getenv("VERIFY_MIN_MINUTES", "5")),
             alert_email=os.getenv("ALERT_EMAIL", "").strip(),
             silence_alert_minutes=int(os.getenv("SILENCE_ALERT_MINUTES", "5")),
+            silence_alert_repeat_minutes=int(
+                os.getenv("SILENCE_ALERT_REPEAT_MINUTES", "1")
+            ),
             email_overrides=_parse_email_overrides(os.getenv("EMAIL_OVERRIDES", "")),
             mail_domain=os.getenv("MAIL_DOMAIN", ""),
             email_enabled="SMTP_HOST" in os.environ,

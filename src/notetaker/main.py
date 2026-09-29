@@ -171,9 +171,7 @@ async def handle_call(cfg: Config, room: dict) -> None:
     # fresh on our behalf.
     recorder.heartbeat_fn = lambda: _touch_heartbeat(cfg)
     recorder.silence_alert_s = cfg.silence_alert_minutes * 60
-    recorder.alert_fn = lambda silent_s, others, rejoins: _alert_silence(
-        cfg, token, name, silent_s, others, rejoins
-    )
+    recorder.silence_repeat_s = cfg.silence_alert_repeat_minutes * 60
     audio_path, speaker_events, attendee_ids = await recorder.record_call(token, name)
     log.info("Captured %d speaker events for room '%s'", len(speaker_events), name)
 
@@ -214,42 +212,6 @@ def _in_call_seconds(recorder, call_start: datetime) -> float:
     if isinstance(measured, (int, float)):
         return float(measured)
     return (datetime.now() - call_start).total_seconds()
-
-
-def _alert_silence(
-    cfg: Config, token: str, name: str, silent_s: float, others: int, rejoins: int
-) -> None:
-    try:
-        _send_silence_alert(cfg, token, name, silent_s, others, rejoins)
-    except Exception:
-        # Runs in a background thread; its result may never be collected.
-        log.exception("Could not send the silence alert for room %s", token)
-
-
-def _send_silence_alert(
-    cfg: Config, token: str, name: str, silent_s: float, others: int, rejoins: int
-) -> None:
-    _send_alert(
-        cfg,
-        {"token": token, "name": name},
-        subject=f"Notetaker is not hearing the call: {name}",
-        lines=[
-            (
-                f'{others} participant(s) are in the call "{name}" (room {token}), '
-                f"but the notetaker has heard nothing for {silent_s / 60:.0f} minutes."
-            ),
-            "",
-            (
-                "If people are talking, it is NOT recording them. Hang up and start "
-                "the call again; the notetaker joins the new call on its own. (If "
-                "everyone is simply muted, ignore this.)"
-            ),
-            "",
-            f"Rejoins it has already tried on its own this call: {rejoins}.",
-        ],
-        notes="",
-        filename="alert.md",
-    )
 
 
 def _resolve_participants(cfg: Config, token: str, attendee_ids: set) -> list[dict]:

@@ -124,7 +124,8 @@ All configuration is via environment variables in `.env`:
 | `ALERT_EMAIL`                 | No       | —                          | Who is told when a recording is held by content verification                   |
 | `MIN_SPEECH_CHARS_PER_MINUTE` | No       | `30`                       | Below this much transcribed speech per minute a call is held, not published    |
 | `VERIFY_MIN_MINUTES`          | No       | `5`                        | Shorter calls are not judged on speech (a test call can be silent)             |
-| `SILENCE_ALERT_MINUTES`       | No       | `5`                        | Mid-call: email `ALERT_EMAIL` when nobody is heard this long with others in the call; 0 = off |
+| `SILENCE_ALERT_MINUTES`       | No       | `5`                        | Mid-call: warn in the call's chat when nobody is heard this long with others in the call; 0 = off |
+| `SILENCE_ALERT_REPEAT_MINUTES`| No       | `1`                        | Repeat that chat warning this often until someone replies in the chat           |
 | `FILENAME_LAST_USER`          | No       | —                          | User ID always placed last in filenames                                        |
 | `POLL_INTERVAL_SECONDS`       | No       | `10`                       | Seconds between poll cycles                                                    |
 | `AUDIO_DIR`                   | No       | `/tmp/notetaker-audio`     | Temp directory for audio files                                                 |
@@ -168,7 +169,7 @@ docker compose exec notetaker python -m notetaker.reprocess --release /data/note
 
 That saves the notes it already made, emails the attendees, and deletes the recording.
 
-During a call, if others are in it but nobody has been heard for `SILENCE_ALERT_MINUTES`, `ALERT_EMAIL` gets a message right away, so a recording that has gone dead can be fixed (hang up and start the call again) instead of discovered afterwards. If the bot finds itself dropped from a call that is still running, it rejoins on its own.
+During a call, if others are in it but nobody has been heard for `SILENCE_ALERT_MINUTES`, the bot says so in the call's own chat — where the people on the call are looking — and repeats it every `SILENCE_ALERT_REPEAT_MINUTES` until someone replies in the chat. A recording that has gone dead can then be fixed (hang up and start the call again) instead of discovered afterwards. If the bot finds itself dropped from a call that is still running, it rejoins on its own.
 
 ## Architecture Notes
 

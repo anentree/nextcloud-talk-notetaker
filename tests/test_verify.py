@@ -550,17 +550,6 @@ def test_bad_verification_settings_are_refused(overrides):
     assert _cfg(**overrides).validate()
 
 
-def test_the_silence_alert_goes_to_the_alert_address_only(tmp_path):
-    from notetaker.main import _alert_silence
-
-    cfg = _pipeline_cfg(tmp_path, smtp_host="host.docker.internal")
-    with patch("notetaker.main.deliver_notes", return_value=True) as email:
-        _alert_silence(cfg, "itujzrjw", "Accounting Talk", 420.0, 2, 1)
-    envelope = email.call_args.args[1]
-    assert [r["email"] for r in envelope["recipients"]] == ["neo@x.com"]
-    assert "7 minutes" in envelope["body"] and "NOT recording" in envelope["body"]
-
-
 def test_a_good_chunked_gemini_call_passes(tmp_path):
     from notetaker.main import _verify_content
     from notetaker.transcriber import make_notes
@@ -638,12 +627,3 @@ def test_the_fallback_length_is_the_recorders_time_in_the_call():
     assert _in_call_seconds(measured, start) == 321.0
     unmeasured = MagicMock(in_call_s=None)
     assert 590 < _in_call_seconds(unmeasured, start) < 610
-
-
-def test_a_silence_alert_failure_is_logged_not_raised(tmp_path, caplog):
-    from notetaker.main import _alert_silence
-
-    cfg = _pipeline_cfg(tmp_path, smtp_host="host.docker.internal")
-    with patch("notetaker.main.deliver_notes", side_effect=OSError("smtp down")):
-        _alert_silence(cfg, "itujzrjw", "Talk", 400.0, 1, 0)
-    assert "Could not send the silence alert" in caplog.text
