@@ -252,8 +252,9 @@ async def _process_recording(cfg: Config, meta: dict, audio_path: str) -> bool:
 def _finish_recording(
     cfg: Config, meta: dict, audio_path: str, participants: list[dict]
 ) -> bool:
-    """Steps 4-6 of the pipeline, shared by the live call and the retained
-    retry: transcribe, save, email. Returns True once the notes are durable."""
+    """Steps 4-7 of the pipeline, shared by the live call and the retained
+    retry: transcribe, save, email, keep the transcript. Returns True once the
+    notes (and the transcript, when one is kept) are durable."""
     token, name = meta["token"], meta["name"]
     call_start = datetime.fromisoformat(meta["call_start"])
 
@@ -262,6 +263,12 @@ def _finish_recording(
     # so the container doesn't report unhealthy while it is doing exactly
     # what it is supposed to do.
     _touch_heartbeat(cfg)
+    # Once either file is stored under this name, a retry must reuse it: a
+    # retry may resolve different participants, and the transcript has to
+    # stay paired with its summary.
+    filename = meta.get("filename") or _build_notes_filename(
+        participants, call_start, last_user=cfg.filename_last_user
+    )
     notes = meta.get("notes")
     if notes:
         # A retry: the notes survived in the sidecar. Doing it again would
@@ -269,23 +276,27 @@ def _finish_recording(
         log.info("Reusing the notes from an earlier attempt for room %s", token)
     else:
         participant_names = [p["display_name"] for p in participants]
-        notes = make_notes(
-            cfg,
-            meta,
-            audio_path,
-            name,
-            # A retry runs days later; the notes are dated by the call.
-            call_start.date().isoformat(),
-            participant_names=participant_names,
-            heartbeat_fn=lambda: _touch_heartbeat(cfg),
-        )
+        try:
+            notes = make_notes(
+                cfg,
+                meta,
+                audio_path,
+                name,
+                # A retry runs days later; the notes are dated by the call.
+                call_start.date().isoformat(),
+                participant_names=participant_names,
+                heartbeat_fn=lambda: _touch_heartbeat(cfg),
+            )
+        except Exception:
+            # Whisper may have finished before the notes step failed. Store
+            # the transcript now rather than leave it only in a sidecar that
+            # the 30-day prune deletes if the notes never come right.
+            _save_transcript(cfg, meta, filename, participants)
+            raise
         meta["notes"] = notes
     _touch_heartbeat(cfg)
 
     # 5. Save notes
-    filename = _build_notes_filename(
-        participants, call_start, last_user=cfg.filename_last_user
-    )
     notes_saved = bool(meta.get("notes_saved"))
     if notes_saved:
         # A retry for the transcript alone; the notes are already stored.
@@ -295,13 +306,11 @@ def _finish_recording(
             _save_notes(cfg, filename, notes)
             notes_saved = True
             meta["notes_saved"] = True
+            meta["filename"] = filename
         except Exception:
             # Keep going: the email below is now the ONLY copy of these notes,
             # which makes delivering it more important, not less.
             log.exception("Failed to save notes for room %s", token)
-
-    # 5b. Save the word-for-word transcript — privately, never emailed
-    transcript_saved = _save_transcript(cfg, meta, filename, participants)
 
     # 6. Email participants (retried, then spooled — never dropped)
     if not cfg.email_enabled:
@@ -335,6 +344,10 @@ def _finish_recording(
     else:
         log.warning("No participants with email found for room %s", token)
         delivered = False
+
+    # 7. Save the word-for-word transcript — privately, never emailed. After
+    # the email so a slow upload here cannot hold the notes back.
+    transcript_saved = _save_transcript(cfg, meta, filename, participants)
 
     log.info(
         "Done processing call in room '%s' (notes_saved=%s, transcript_saved=%s, "
@@ -401,6 +414,7 @@ def _save_transcript(
         log.exception("Failed to save the transcript for room %s", meta.get("token"))
         return False
     meta["transcript_saved"] = True
+    meta["filename"] = filename
     return True
 
 

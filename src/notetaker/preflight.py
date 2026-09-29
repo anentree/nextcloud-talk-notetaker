@@ -84,6 +84,43 @@ def check_notes_target(cfg: Config) -> None:
         raise RuntimeError(f"WebDAV PROPFIND returned {resp.status_code}")
 
 
+def check_transcripts_target(cfg: Config) -> None:
+    """Confirm the private transcript folder exists and is reachable. Found
+    missing here, it is a clear message at boot; found missing at the end of
+    a call, every recording is retained and retried for 30 days."""
+    problems = cfg.transcripts_problems()
+    if problems:
+        raise RuntimeError("; ".join(problems))
+    if cfg.notes_storage == "local":
+        import os
+
+        os.makedirs(cfg.local_transcripts_dir, exist_ok=True)
+        if not os.access(cfg.local_transcripts_dir, os.W_OK):
+            raise RuntimeError(
+                f"LOCAL_TRANSCRIPTS_DIR not writable: {cfg.local_transcripts_dir}"
+            )
+        return
+
+    folder = "/".join(p for p in cfg.transcripts_folder.split("/") if p)
+    resp = requests.request(
+        "PROPFIND",
+        f"{cfg.nextcloud_url}/remote.php/dav/files/{cfg.nextcloud_user}/{folder}",
+        auth=(cfg.nextcloud_user, cfg.nextcloud_password),
+        headers={"Depth": "0"},
+        timeout=15,
+    )
+    if resp.status_code == 404:
+        raise RuntimeError(
+            f"TRANSCRIPTS_FOLDER {cfg.transcripts_folder} does not exist for "
+            f"{cfg.nextcloud_user}. Share a folder of that name with the bot "
+            "(and nobody else), or unset TRANSCRIPTS_FOLDER"
+        )
+    if resp.status_code not in (207, 200):
+        raise RuntimeError(
+            f"WebDAV PROPFIND on TRANSCRIPTS_FOLDER returned {resp.status_code}"
+        )
+
+
 def check_gemini(cfg: Config) -> None:
     """Confirm the API key is valid and the configured model exists."""
     resp = requests.get(
@@ -198,7 +235,16 @@ def check_whisper(cfg: Config) -> None:
         )
 
 
-CHECK_NAMES = ("state-dir", "smtp", "nextcloud", "notes-target", "gemini", "claude", "whisper")
+CHECK_NAMES = (
+    "state-dir",
+    "smtp",
+    "nextcloud",
+    "notes-target",
+    "transcripts-target",
+    "gemini",
+    "claude",
+    "whisper",
+)
 
 
 def run_preflight(cfg: Config) -> list[str]:
@@ -214,6 +260,7 @@ def run_preflight(cfg: Config) -> list[str]:
         ("smtp", check_smtp),
         ("nextcloud", check_nextcloud),
         ("notes-target", check_notes_target),
+        ("transcripts-target", check_transcripts_target),
         ("gemini", check_gemini),
         ("claude", check_claude),
         ("whisper", check_whisper),
@@ -226,6 +273,9 @@ def run_preflight(cfg: Config) -> list[str]:
             "PREFLIGHT skipping smtp: email is disabled because SMTP_HOST is unset"
         )
         checks = [c for c in checks if c[0] != "smtp"]
+
+    if not cfg.transcripts_enabled:
+        checks = [c for c in checks if c[0] != "transcripts-target"]
 
     if cfg.notes_backend == "claude":
         log.info("PREFLIGHT skipping gemini: NOTES_BACKEND is claude")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
@@ -16,10 +17,17 @@ def _normalise(value: str | None) -> str:
 
 
 def _path_parts(path: str) -> list[str]:
-    """Folder path as comparable segments. Casefolded so a near-miss like
-    /Meeting-Notes/x is still caught as inside /meeting-notes."""
-    normalised = os.path.normpath("/" + (path or "").strip()).replace("\\", "/")
+    """Folder path as comparable segments. NFC like Nextcloud's own paths, and
+    casefolded so a near-miss like /Meeting-Notes/x is still caught as inside
+    /meeting-notes."""
+    text = unicodedata.normalize("NFC", (path or "").strip())
+    normalised = os.path.normpath("/" + text).replace("\\", "/")
     return [p.casefold() for p in normalised.split("/") if p]
+
+
+# A Nextcloud folder name with any of these can reach the server as a
+# different path than the one compared here (%2F decodes to a slash).
+_UNSAFE_FOLDER_CHARS = re.compile(r"[%\\?#\x00-\x1f\x7f]")
 
 
 def _parse_email_overrides(raw: str) -> dict[str, str]:
@@ -122,7 +130,7 @@ class Config:
             )
         if self.notes_storage == "local" and not self.local_notes_dir:
             problems.append("NOTES_STORAGE=local requires LOCAL_NOTES_DIR")
-        problems.extend(self._validate_transcripts())
+        problems.extend(self.transcripts_problems())
         if self.auth_method not in ("nextcloud", "yunohost"):
             problems.append(
                 f"AUTH_METHOD must be 'nextcloud' or 'yunohost' (got {self.auth_method!r})"
@@ -159,44 +167,103 @@ class Config:
             return bool(self.local_transcripts_dir)
         return bool(self.transcripts_folder)
 
-    def _validate_transcripts(self) -> list[str]:
-        """In Nextcloud the notes folder is shared with the attendees, so the
-        transcript must never land in it, directly or in a subfolder. A local
-        notes directory is shared with nobody; there it only needs to differ,
-        or a transcript would overwrite the notes of the same name."""
-        if self.notes_storage == "local":
-            if not self.local_transcripts_dir:
-                return []
-            if _path_parts(self.local_transcripts_dir) == _path_parts(
-                self.local_notes_dir
-            ):
-                return [
-                    (
-                        "LOCAL_TRANSCRIPTS_DIR must differ from LOCAL_NOTES_DIR "
-                        f"(both are {self.local_notes_dir!r})"
-                    )
-                ]
-            return []
+    def transcripts_problems(self) -> list[str]:
+        """Why the transcript destination is unsafe, or [] if it is fine.
 
-        if not self.transcripts_folder:
-            return []
-        notes_parts = _path_parts(self.notes_folder)
-        transcripts_parts = _path_parts(self.transcripts_folder)
-        if not transcripts_parts:
+        Checked by validate() at startup and again before every save, so
+        SKIP_PREFLIGHT or reprocess.py cannot put a transcript somewhere the
+        attendees can read it."""
+        if self.notes_storage == "local":
+            return self._local_transcripts_problems()
+        return self._nextcloud_transcripts_problems()
+
+    def _nextcloud_transcripts_problems(self) -> list[str]:
+        """In Nextcloud the notes folder is shared with the attendees. The
+        check can only see names, not which folder carries the share, so it
+        refuses every layout where one share could cover both: the same
+        folder, one inside the other, or any common parent folder."""
+        if self.local_transcripts_dir:
             return [
                 (
-                    "TRANSCRIPTS_FOLDER must name a folder, not the root "
-                    f"(got {self.transcripts_folder!r})"
+                    "LOCAL_TRANSCRIPTS_DIR is only used with NOTES_STORAGE=local; "
+                    "set TRANSCRIPTS_FOLDER instead"
                 )
             ]
-        if transcripts_parts[: len(notes_parts)] == notes_parts:
+        folder = self.transcripts_folder
+        if not folder:
+            return []
+        if _UNSAFE_FOLDER_CHARS.search(folder):
             return [
                 (
-                    f"TRANSCRIPTS_FOLDER ({self.transcripts_folder}) must not be "
-                    f"NOTES_FOLDER ({self.notes_folder}) or inside it: the notes "
+                    "TRANSCRIPTS_FOLDER may not contain %, \\, ?, # or control "
+                    f"characters (got {folder!r})"
+                )
+            ]
+        transcripts_parts = _path_parts(folder)
+        notes_parts = _path_parts(self.notes_folder)
+        if not transcripts_parts:
+            return [
+                f"TRANSCRIPTS_FOLDER must name a folder, not the root (got {folder!r})"
+            ]
+        shared = 0
+        for a, b in zip(transcripts_parts, notes_parts):
+            if a != b:
+                break
+            shared += 1
+        if shared == len(notes_parts) or shared == len(transcripts_parts):
+            return [
+                (
+                    f"TRANSCRIPTS_FOLDER ({folder}) must not be NOTES_FOLDER "
+                    f"({self.notes_folder}), inside it or above it: the notes "
                     "folder is shared with the attendees and transcripts are private"
                 )
             ]
+        if shared:
+            return [
+                (
+                    f"TRANSCRIPTS_FOLDER ({folder}) must not share a parent folder "
+                    f"with NOTES_FOLDER ({self.notes_folder}): a share on that "
+                    "parent would expose the transcripts. Use a separate "
+                    "top-level folder such as /meeting-notes-transcriptions"
+                )
+            ]
+        return []
+
+    def _local_transcripts_problems(self) -> list[str]:
+        """A local notes directory is shared with nobody, so there the
+        transcripts only need their own directory — one the notetaker does
+        not prune or clear."""
+        if self.transcripts_folder:
+            return [
+                (
+                    "TRANSCRIPTS_FOLDER is only used with NOTES_STORAGE=nextcloud; "
+                    "set LOCAL_TRANSCRIPTS_DIR instead"
+                )
+            ]
+        folder = self.local_transcripts_dir
+        if not folder:
+            return []
+        parts = _path_parts(folder)
+        if parts == _path_parts(self.local_notes_dir):
+            return [
+                (
+                    "LOCAL_TRANSCRIPTS_DIR must differ from LOCAL_NOTES_DIR "
+                    f"(both are {self.local_notes_dir!r})"
+                )
+            ]
+        for name, managed in (
+            ("the retained-audio directory", self.retained_audio_dir),
+            ("the email spool", self.spool_dir),
+            ("AUDIO_DIR", self.audio_dir),
+        ):
+            managed_parts = _path_parts(managed)
+            if parts[: len(managed_parts)] == managed_parts:
+                return [
+                    (
+                        f"LOCAL_TRANSCRIPTS_DIR ({folder}) must not be inside {name} "
+                        f"({managed}), which the notetaker deletes from"
+                    )
+                ]
         return []
 
     def _validate_smtp(self) -> list[str]:

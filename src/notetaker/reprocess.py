@@ -149,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(notes)
         log.info("Wrote notes to %s", args.out)
-        if document:
+        if document and cfg.transcripts_enabled:
             stem, ext = os.path.splitext(args.out)
             out = f"{stem}-transcript{ext or '.md'}"
             with open(out, "w", encoding="utf-8") as f:

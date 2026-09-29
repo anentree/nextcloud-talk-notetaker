@@ -61,7 +61,7 @@ Add the bot user as a participant in any Talk room you want it to monitor. The b
 
 Create a folder in your Nextcloud (e.g., `meeting-notes`) and share it with the bot user. The bot saves notes into this shared folder.
 
-To also keep the word-for-word transcript of each call (Whisper backend only), create a second folder (e.g., `meeting-notes-transcriptions`), share it with the bot user **only**, and set `TRANSCRIPTS_FOLDER` to it. Transcripts are never emailed; anyone the notes folder is shared with sees the summaries, not the transcripts. The bot refuses to start if `TRANSCRIPTS_FOLDER` is the notes folder or inside it.
+To also keep the word-for-word transcript of each call (Whisper backend only), create a second folder (e.g., `meeting-notes-transcriptions`), share it with the bot user **only**, and set `TRANSCRIPTS_FOLDER` to it. Transcripts are never emailed; anyone the notes folder is shared with sees the summaries, not the transcripts. The bot refuses to start if `TRANSCRIPTS_FOLDER` is missing, or is the notes folder, inside or above it, or shares a parent folder with it — the check sees folder names, not shares, so it refuses every layout where one share could cover both. It checks again before every save, so `SKIP_PREFLIGHT` does not bypass it.
 
 ### 4. Set up subadmin for email lookup (optional)
 
@@ -119,7 +119,7 @@ All configuration is via environment variables in `.env`:
 | `NOTES_STORAGE`               | No       | `nextcloud`                | `nextcloud` (WebDAV) or `local` (filesystem)                                   |
 | `NOTES_FOLDER`                | No       | `/Talk/Notes`              | Nextcloud folder for notes (the wizard sets `/meeting-notes`)                  |
 | `LOCAL_NOTES_DIR`             | No       | —                          | Local directory for notes (when storage=local)                                 |
-| `TRANSCRIPTS_FOLDER`          | No       | —                          | Nextcloud folder for the verbatim Whisper transcript; never emailed; must not be inside `NOTES_FOLDER` |
+| `TRANSCRIPTS_FOLDER`          | No       | —                          | Nextcloud folder for the verbatim Whisper transcript; never emailed; top-level, separate from `NOTES_FOLDER` |
 | `LOCAL_TRANSCRIPTS_DIR`       | No       | —                          | Local directory for transcripts (when storage=local)                           |
 | `FILENAME_LAST_USER`          | No       | —                          | User ID always placed last in filenames                                        |
 | `POLL_INTERVAL_SECONDS`       | No       | `10`                       | Seconds between poll cycles                                                    |

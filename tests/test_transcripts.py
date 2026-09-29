@@ -102,6 +102,10 @@ def test_document_omits_attendees_when_unknown():
         "/meeting-notes/transcripts",
         "/Meeting-Notes/transcripts",
         "/meeting-notes/../meeting-notes/x",
+        "/x/../meeting-notes/y",
+        "/meeting-notes%2Fprivate",
+        "/meeting-notes\\private",
+        "/meeting-notes/private?x",
         "/",
     ],
 )
@@ -120,9 +124,57 @@ def test_a_separate_transcripts_folder_is_accepted(tmp_path, folder):
     assert cfg.validate() == []
 
 
+@pytest.mark.parametrize(
+    "folder",
+    ["/meeting-notes", "/meeting-notes/transcriptions", "/meeting-notes/summaries/x"],
+)
+def test_no_share_on_a_common_parent_could_expose_the_transcripts(tmp_path, folder):
+    """The check sees names, not shares. With the summaries in a subfolder of
+    a shared folder, a transcript anywhere under that folder would leak."""
+    cfg = _cfg(
+        tmp_path, notes_folder="/meeting-notes/summaries", transcripts_folder=folder
+    )
+    assert any("TRANSCRIPTS_FOLDER" in p for p in cfg.validate())
+
+
+def test_unicode_variants_of_the_notes_folder_are_caught(tmp_path):
+    nfc, nfd = "/caf\u00e9", "/cafe\u0301/x"
+    cfg = _cfg(tmp_path, notes_folder=nfc, transcripts_folder=nfd)
+    assert any("TRANSCRIPTS_FOLDER" in p for p in cfg.validate())
+
+
+def test_mixing_storage_modes_is_refused_not_silently_ignored(tmp_path):
+    local = _cfg(
+        tmp_path,
+        notes_storage="local",
+        local_notes_dir="/data/notes",
+        transcripts_folder="/meeting-notes-transcriptions",
+    )
+    assert any("TRANSCRIPTS_FOLDER" in p for p in local.validate())
+    remote = _cfg(tmp_path, transcripts_folder="", local_transcripts_dir="/data/t")
+    assert any("LOCAL_TRANSCRIPTS_DIR" in p for p in remote.validate())
+
+
+def test_local_transcripts_may_not_live_where_the_notetaker_deletes(tmp_path):
+    for folder in (
+        str(tmp_path / "state" / "retained-audio" / "t"),
+        str(tmp_path / "state" / "failed-email"),
+        "/tmp/notetaker-audio/t",
+    ):
+        cfg = _cfg(
+            tmp_path,
+            transcripts_folder="",
+            notes_storage="local",
+            local_notes_dir="/data/notes",
+            local_transcripts_dir=folder,
+        )
+        assert any("LOCAL_TRANSCRIPTS_DIR" in p for p in cfg.validate()), folder
+
+
 def test_local_transcripts_dir_must_differ_but_may_be_a_subfolder(tmp_path):
     same = _cfg(
         tmp_path,
+        transcripts_folder="",
         notes_storage="local",
         local_notes_dir="/data/notes",
         local_transcripts_dir="/data/notes/",
@@ -130,6 +182,7 @@ def test_local_transcripts_dir_must_differ_but_may_be_a_subfolder(tmp_path):
     assert any("LOCAL_TRANSCRIPTS_DIR" in p for p in same.validate())
     sub = _cfg(
         tmp_path,
+        transcripts_folder="",
         notes_storage="local",
         local_notes_dir="/data/notes",
         local_transcripts_dir="/data/notes/transcripts",
@@ -273,6 +326,99 @@ def test_a_failed_notes_upload_still_saves_the_transcript_once(
     assert not os.path.exists(_dest(cfg))
 
 
+def test_an_unsafe_folder_is_refused_even_with_preflight_skipped(
+    tmp_path, whisper_pipeline
+):
+    """SKIP_PREFLIGHT skips validate(); the save itself must still refuse."""
+    cfg = _cfg(
+        tmp_path,
+        notes_folder="/meeting-notes",
+        transcripts_folder="/meeting-notes/private",
+    )
+    audio = _audio(tmp_path)
+    with patch("notetaker.main.AudioRecorder", return_value=_recorder(audio)):
+        _run_call(cfg)
+
+    whisper_pipeline["transcript_upload"].assert_not_called()
+    whisper_pipeline["notes_upload"].assert_called_once()
+    assert os.path.exists(_dest(cfg))  # kept until the folder is fixed
+
+
+def test_the_transcript_is_kept_even_when_the_notes_step_fails(
+    tmp_path, whisper_pipeline
+):
+    """Whisper finished, the summary did not. The transcript is stored now,
+    not left in a sidecar the 30-day prune deletes; the retry then stores the
+    notes under the same name and does not upload the transcript again."""
+    from notetaker.main import drain_retained
+
+    cfg = _cfg(tmp_path)
+    audio = _audio(tmp_path)
+    with (
+        patch(
+            "notetaker.transcriber.summarize_transcript",
+            side_effect=RuntimeError("quota"),
+        ),
+        patch("notetaker.main.AudioRecorder", return_value=_recorder(audio)),
+        pytest.raises(RuntimeError),
+    ):
+        _run_call(cfg)
+
+    whisper_pipeline["transcript_upload"].assert_called_once()
+    transcript_name = whisper_pipeline["transcript_upload"].call_args.args[4]
+    whisper_pipeline["notes_upload"].assert_not_called()
+    whisper_pipeline["email"].assert_not_called()
+    assert os.path.exists(_dest(cfg))
+
+    with patch("notetaker.retained.time.time", return_value=9e9):
+        drain_retained(cfg)
+
+    whisper_pipeline["notes_upload"].assert_called_once()
+    assert whisper_pipeline["notes_upload"].call_args.args[4] == transcript_name
+    whisper_pipeline["transcript_upload"].assert_called_once()
+    whisper_pipeline["email"].assert_called_once()
+    assert whisper_pipeline["whisper"].call_count == 1
+    assert not os.path.exists(_dest(cfg))
+
+
+def test_a_retry_keeps_the_name_the_first_file_was_stored_under(
+    tmp_path, whisper_pipeline
+):
+    """The live call's recipient lookup failed (names 'unknown'); the retry
+    resolves real names. The pair must still share one filename."""
+    from notetaker.main import drain_retained
+
+    cfg = _cfg(tmp_path)
+    audio = _audio(tmp_path)
+    whisper_pipeline["notes_upload"].side_effect = RuntimeError("Nextcloud 502")
+    with (
+        patch("notetaker.main.get_participant_emails", return_value=[]),
+        patch("notetaker.main.AudioRecorder", return_value=_recorder(audio)),
+    ):
+        _run_call(cfg)
+    transcript_name = whisper_pipeline["transcript_upload"].call_args.args[4]
+    assert transcript_name.endswith("-unknown.md")
+
+    whisper_pipeline["notes_upload"].side_effect = None
+    with patch("notetaker.retained.time.time", return_value=9e9):
+        drain_retained(cfg)
+
+    assert whisper_pipeline["notes_upload"].call_args.args[4] == transcript_name
+
+
+def test_the_email_goes_out_before_the_transcript_upload(tmp_path, whisper_pipeline):
+    order = []
+    whisper_pipeline["email"].side_effect = lambda *a, **k: order.append("email")
+    whisper_pipeline["transcript_upload"].side_effect = lambda *a, **k: order.append(
+        "transcript"
+    )
+    cfg = _cfg(tmp_path)
+    audio = _audio(tmp_path)
+    with patch("notetaker.main.AudioRecorder", return_value=_recorder(audio)):
+        _run_call(cfg)
+    assert order == ["email", "transcript"]
+
+
 def test_room_members_are_not_listed_as_attendees(tmp_path, whisper_pipeline):
     """With no observed attendees, recipients fall back to room membership —
     which says nothing about who was on the call."""
@@ -323,6 +469,7 @@ def test_local_storage_writes_the_transcript_to_its_own_directory(
     transcripts_dir = tmp_path / "notes" / "transcripts"
     cfg = _cfg(
         tmp_path,
+        transcripts_folder="",
         notes_storage="local",
         local_notes_dir=str(notes_dir),
         local_transcripts_dir=str(transcripts_dir),
@@ -410,3 +557,88 @@ def test_reprocess_out_writes_the_transcript_beside_the_notes(tmp_path, monkeypa
 
     assert out.read_text() == NOTES
     assert TRANSCRIPT_LINES[0] in (tmp_path / "recovered-transcript.md").read_text()
+
+
+def test_reprocess_out_writes_no_transcript_when_transcripts_are_off(
+    tmp_path, monkeypatch
+):
+    from notetaker import reprocess
+
+    _reprocess_env(monkeypatch, transcripts_folder="")
+    audio = _retained_with_transcript(tmp_path)
+    out = tmp_path / "recovered.md"
+    with (
+        patch("notetaker.transcriber._get_audio_duration", return_value=60.0),
+        patch("notetaker.transcriber.summarize_transcript", return_value=NOTES),
+    ):
+        assert reprocess.main([str(audio), "--out", str(out)]) == 0
+
+    assert out.read_text() == NOTES
+    assert not (tmp_path / "recovered-transcript.md").exists()
+
+
+def test_reprocess_refuses_an_unsafe_transcripts_folder(tmp_path, monkeypatch):
+    from notetaker import reprocess
+
+    _reprocess_env(monkeypatch, transcripts_folder="/meeting-notes-summaries/t")
+    audio = _retained_with_transcript(tmp_path)
+    with (
+        patch("notetaker.transcriber._get_audio_duration", return_value=60.0),
+        patch("notetaker.transcriber.summarize_transcript", return_value=NOTES),
+        patch("notetaker.reprocess.upload_notes"),
+        patch("notetaker.transcripts.upload_notes") as transcript_upload,
+        pytest.raises(RuntimeError, match="TRANSCRIPTS_FOLDER"),
+    ):
+        reprocess.main([str(audio)])
+    transcript_upload.assert_not_called()
+
+
+# --- preflight ------------------------------------------------------------------
+
+
+def _propfind(status):
+    resp = MagicMock()
+    resp.status_code = status
+    return resp
+
+
+def test_preflight_fails_when_the_transcripts_folder_is_missing(tmp_path):
+    from notetaker.preflight import check_transcripts_target
+
+    cfg = _cfg(tmp_path)
+    with (
+        patch("notetaker.preflight.requests.request", return_value=_propfind(404)),
+        pytest.raises(RuntimeError, match="does not exist"),
+    ):
+        check_transcripts_target(cfg)
+    with patch(
+        "notetaker.preflight.requests.request", return_value=_propfind(207)
+    ) as req:
+        check_transcripts_target(cfg)
+    assert req.call_args.args[1].endswith("/files/bot/meeting-notes-transcriptions")
+
+
+def test_preflight_runs_the_transcripts_check_only_when_enabled(tmp_path):
+    from notetaker import preflight
+
+    names = []
+
+    def record(name):
+        return lambda cfg: names.append(name)
+
+    with patch.multiple(
+        preflight,
+        check_state_dir=record("state-dir"),
+        check_smtp=record("smtp"),
+        check_nextcloud=record("nextcloud"),
+        check_notes_target=record("notes-target"),
+        check_transcripts_target=record("transcripts-target"),
+        check_gemini=record("gemini"),
+        check_claude=record("claude"),
+        check_whisper=record("whisper"),
+    ):
+        preflight.run_preflight(_cfg(tmp_path))
+        assert "transcripts-target" in names
+        names.clear()
+        preflight.run_preflight(_cfg(tmp_path, transcripts_folder=""))
+        assert "transcripts-target" not in names

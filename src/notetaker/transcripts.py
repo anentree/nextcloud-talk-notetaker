@@ -48,7 +48,14 @@ def build_document(
 
 def save(cfg, filename: str, document: str) -> str:
     """Write the transcript to its private destination. Returns where it went.
-    Raises on failure; the caller decides whether to retry."""
+    Raises on failure; the caller decides whether to retry.
+
+    Re-checks the destination every time: startup validation can be skipped
+    (SKIP_PREFLIGHT) and reprocess.py never runs it, and a transcript written
+    into the shared notes folder cannot be taken back."""
+    problems = cfg.transcripts_problems()
+    if problems:
+        raise RuntimeError("; ".join(problems))
     if cfg.notes_storage == "local":
         os.makedirs(cfg.local_transcripts_dir, exist_ok=True)
         path = os.path.join(cfg.local_transcripts_dir, filename)
