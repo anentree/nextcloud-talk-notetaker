@@ -15,12 +15,29 @@ import re
 # A summary shorter than this is a header and nothing else.
 MIN_NOTES_CHARS = 150
 
-_TIMESTAMP = re.compile(r"^\[\d{1,3}:\d{2}\]\s*", re.MULTILINE)
+_TIMESTAMP = re.compile(r"^\[\d{1,3}:\d{2}\]\s*")
+# Lines that are the pipeline talking, not the call: Gemini's markers for a
+# silent or failed segment.
+_MARKER = re.compile(r"^\[(NO SPEECH|SEGMENT \d+ OF \d+ UNAVAILABLE)", re.IGNORECASE)
 
 
 def speech_chars(transcript: str) -> int:
-    """Characters of transcribed speech, without the [MM:SS] stamps."""
-    return len(_TIMESTAMP.sub("", transcript).strip())
+    """Characters of transcribed speech: timestamps and pipeline markers
+    removed, and each distinct line counted once. Whisper hallucinates on
+    silence ("Thanks for watching!" over and over); repeating a line must
+    not add up to a conversation."""
+    seen: set[str] = set()
+    total = 0
+    for raw in transcript.splitlines():
+        line = _TIMESTAMP.sub("", raw).strip()
+        if not line or _MARKER.match(line):
+            continue
+        key = line.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        total += len(line)
+    return total
 
 
 def check_content(
@@ -32,12 +49,16 @@ def check_content(
 ) -> list[str]:
     """Reasons the call's output cannot be trusted, or [] if it can.
 
-    ``transcript`` is None when the notes came straight from audio (the
-    Gemini path), which leaves only the notes to judge. ``duration_s`` is
-    None when the recording's length could not be read; the speech check is
-    then skipped rather than guessed at.
+    ``transcript`` is the Whisper transcript, or the Gemini segment
+    transcripts; None when there is neither (Gemini single-pass). Every
+    unknown fails closed: holding a good call costs an alert, publishing a
+    bad one costs the call.
     """
-    short = bool(duration_s) and duration_s / 60 < cfg.verify_min_minutes
+    if not duration_s:
+        # Fail closed: without the length there is no judging the content.
+        return ["the length of the recording could not be read"]
+    minutes = duration_s / 60
+    short = minutes < cfg.verify_min_minutes
     if short and transcript == no_speech_marker:
         # Someone opened a call and closed it. The one-line "no speech"
         # notes are the right output, not a failure worth an alert.
@@ -47,13 +68,18 @@ def check_content(
     notes_chars = len((notes or "").strip())
     if notes_chars < MIN_NOTES_CHARS:
         problems.append(f"the notes are empty ({notes_chars} characters)")
-
-    if transcript is None or not duration_s or short:
-        # No transcript (Gemini audio path) or no length: only the notes can
-        # be judged. A short call can legitimately be almost silent.
+    if short:
+        # A short call can legitimately be almost silent.
+        return problems
+    if transcript is None:
+        # Notes written straight from audio, with nothing to check them
+        # against. Fail closed rather than trust them.
+        problems.append(
+            f"there is no transcript to check the notes of a {minutes:.0f}-minute "
+            "call against"
+        )
         return problems
 
-    minutes = duration_s / 60
     chars = 0 if transcript == no_speech_marker else speech_chars(transcript)
     per_minute = chars / minutes
     if per_minute < cfg.min_speech_chars_per_minute:

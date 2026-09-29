@@ -376,7 +376,8 @@ def test_gemini_backend_forwards_everything_as_keywords(gemini_audio, whisper_tr
     assert notes == "# Gemini notes"
     whisper_tr.assert_not_called()
     assert gemini_audio.call_args.args == ("key", str(audio), "Standup")
-    kw = gemini_audio.call_args.kwargs
+    kw = dict(gemini_audio.call_args.kwargs)
+    assert kw.pop("transcript_sink") == []
     assert kw == {
         "model": "gemini-2.5-flash",
         "speaker_events": EVENTS,

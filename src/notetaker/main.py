@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -183,6 +184,9 @@ async def handle_call(cfg: Config, room: dict) -> None:
         "speaker_events": speaker_events,
         "attendee_ids": sorted(attendee_ids),
         "participants": None,
+        # How long the bot was in the call: the fallback length when the
+        # recording itself cannot be measured.
+        "recorded_s": (datetime.now() - call_start).total_seconds(),
     }
 
     # Everything from here on must leave the recording in a defined state:
@@ -237,6 +241,23 @@ async def _process_recording(cfg: Config, meta: dict, audio_path: str) -> bool:
     if audio_size == 0:
         log.warning("Empty audio file for room '%s' — skipping transcription", name)
         # Nothing to preserve: an empty file is not evidence of anything.
+        # But people attended and nothing was captured, which is the same
+        # silent failure as 2026-09-29 one step earlier; someone must know.
+        if meta.get("attendee_ids"):
+            _send_alert(
+                cfg,
+                meta,
+                subject=f"Notetaker captured no audio: {name}",
+                lines=[
+                    (
+                        f'The notetaker was in the call "{name}" (room {token}) with '
+                        f"{', '.join(meta['attendee_ids'])} but captured no audio at all, "
+                        "so there are no notes and nothing was sent to anyone."
+                    ),
+                ],
+                notes="",
+                filename="no-audio.md",
+            )
         return True
     log.info("Audio file: %s (%d KB)", audio_path, audio_size // 1024)
 
@@ -310,7 +331,7 @@ def _finish_recording(
     # outside attendee, and the recording deleted.
     problems = _verify_content(cfg, meta, audio_path, notes)
     if problems:
-        return _hold_recording(cfg, meta, filename, participants, problems)
+        return _hold_recording(cfg, meta, audio_path, filename, participants, problems)
 
     # 5. Save notes
     notes_saved = bool(meta.get("notes_saved"))
@@ -386,21 +407,31 @@ def _verify_content(cfg: Config, meta: dict, audio_path: str, notes: str) -> lis
     if meta.get("content_accepted"):
         # Released by hand with reprocess.py --release.
         return []
+    if meta.get("notes_saved") or meta.get("email_done"):
+        # Already published by an earlier attempt (a recording retained
+        # before verification existed, or a threshold changed since). Holding
+        # it now would claim nothing went out when it did.
+        return []
     if "duration_s" not in meta:
         try:
             meta["duration_s"] = transcriber._get_audio_duration(audio_path)
         except Exception:
-            # Unknown length: verify.py skips the speech check rather than guess.
+            # Fall back to how long the bot was in the call; verify.py holds
+            # the recording if neither is known.
             log.warning("Could not read the length of %s", audio_path, exc_info=True)
-            meta["duration_s"] = None
+            meta["duration_s"] = meta.get("recorded_s")
+    transcript = meta.get("transcript")
+    if transcript is None:
+        transcript = meta.get("gemini_transcript")
     return verify.check_content(
-        cfg, notes, meta.get("transcript"), meta["duration_s"], NO_SPEECH_SENTINEL
+        cfg, notes, transcript, meta["duration_s"], NO_SPEECH_SENTINEL
     )
 
 
 def _hold_recording(
     cfg: Config,
     meta: dict,
+    audio_path: str,
     filename: str,
     participants: list[dict],
     problems: list[str],
@@ -408,8 +439,8 @@ def _hold_recording(
     """Keep a recording whose output failed verification. Nothing reaches the
     attendees: no notes in the shared folder, no email. The transcript goes to
     its private folder for review, ALERT_EMAIL is told, and the recording is
-    parked — kept, never retried on its own — until someone releases it with
-    reprocess.py --release or the retention window deletes it."""
+    parked in retained-audio — never retried on its own and never pruned —
+    until someone releases it with reprocess.py --release or deletes it."""
     token = meta.get("token", "unknown")
     meta["parked"] = True
     meta["held"] = problems
@@ -420,40 +451,82 @@ def _hold_recording(
         "; ".join(problems),
     )
     _save_transcript(cfg, meta, filename, participants)
+
+    # Retain it here rather than in handle_call so the alert can name the
+    # exact file. A retry is already in retained-audio.
+    held_path = audio_path
+    retained_dir = os.path.realpath(cfg.retained_audio_dir)
+    if os.path.dirname(os.path.realpath(audio_path)) != retained_dir:
+        try:
+            held_path = retained.retain(cfg.retained_audio_dir, audio_path, meta)
+        except Exception:
+            log.exception("Could not retain the held recording %s", audio_path)
+    log.error("Held recording for room %s is at %s", token, held_path)
+
     if meta.get("alert_sent"):
         return False
-    if not (cfg.alert_email and cfg.email_enabled):
-        log.error("ALERT_EMAIL is not set; nobody was told about the held recording")
-        return False
     call_start = datetime.fromisoformat(meta["call_start"])
-    lines = [
-        (
-            f'The notetaker held the recording of "{meta.get("name", token)}" '
-            f"({call_start:%Y-%m-%d %H:%M}) because its output failed verification:"
-        ),
-        "",
-        *[f"- {p}" for p in problems],
-        "",
-        (
-            "Nothing was emailed to the attendees and no notes were put in the "
-            "shared folder. The notes it produced are attached."
-        ),
-        "",
-        f"Attendees: {', '.join(p['display_name'] for p in participants) or 'unknown'}",
-        f"Room: {token}",
-        "",
-        (
-            "The recording is kept in the retained-audio folder (notes/retained-audio "
-            f"on the server, a file starting with {token}-) for "
-            f"{cfg.retained_audio_max_age_days} days. If the call really was this "
-            "quiet, release it to the attendees with:"
-        ),
-        "",
-        (
-            "  docker compose exec notetaker python -m notetaker.reprocess --release "
-            f"/data/notes/retained-audio/{token}-<file>.webm"
-        ),
-    ]
+    container_path = os.path.join(
+        "/data/notes/retained-audio", os.path.basename(held_path)
+    )
+    _send_alert(
+        cfg,
+        meta,
+        subject=f"Notetaker held a recording: {meta.get('name', token)}",
+        lines=[
+            (
+                f'The notetaker held the recording of "{meta.get("name", token)}" '
+                f"({call_start:%Y-%m-%d %H:%M}) because its output failed verification:"
+            ),
+            "",
+            *[f"- {p}" for p in problems],
+            "",
+            (
+                "Nothing was emailed to the attendees and no notes were put in the "
+                "shared folder. The notes it produced are attached."
+            ),
+            "",
+            "Attendees: "
+            + (", ".join(p["display_name"] for p in participants) or "unknown"),
+            f"Room: {token}",
+            "",
+            (
+                f"The recording is kept at notes/retained-audio/{os.path.basename(held_path)} "
+                "on the server until you release or delete it. If the call really "
+                "was this quiet, release it to the attendees with:"
+            ),
+            "",
+            (
+                "  docker compose exec notetaker python -m notetaker.reprocess "
+                f"--release {container_path}"
+            ),
+        ],
+        notes=meta.get("notes") or "",
+        filename=filename,
+    )
+    if held_path != audio_path and meta.get("alert_sent"):
+        # The sidecar was written before the alert; record that it went out.
+        try:
+            sidecar = retained.sidecar_path(held_path)
+            with open(sidecar, encoding="utf-8") as f:
+                record = json.load(f)
+            record["alert_sent"] = True
+            retained._atomic_write(sidecar, record)
+        except (OSError, ValueError):
+            log.warning("Could not record the alert in %s", held_path, exc_info=True)
+    return False
+
+
+def _send_alert(
+    cfg: Config, meta: dict, subject: str, lines: list[str], notes: str, filename: str
+) -> None:
+    """Tell ALERT_EMAIL, and only ALERT_EMAIL, that a call needs a human."""
+    if not (cfg.alert_email and cfg.email_enabled):
+        log.error(
+            "ALERT_EMAIL is not set or email is off; nobody was told: %s", subject
+        )
+        return
+    token = meta.get("token", "unknown")
     deliver_notes(
         cfg,
         {
@@ -462,15 +535,14 @@ def _hold_recording(
             "recipients": [
                 {"user_id": "", "display_name": "", "email": cfg.alert_email}
             ],
-            "subject": f"Notetaker held a recording: {meta.get('name', token)}",
+            "subject": subject,
             "body": "\n".join(lines),
-            "notes": meta.get("notes") or "",
+            "notes": notes,
             "filename": filename,
         },
     )
     # Sent or spooled; either way a later pass must not send it again.
     meta["alert_sent"] = True
-    return False
 
 
 def _save_notes(cfg: Config, filename: str, notes: str) -> None:
@@ -600,7 +672,12 @@ def prune_retained_audio(cfg: Config) -> int:
     forever on the notes volume.
     """
     removed = _prune_dir(
-        cfg.retained_audio_dir, cfg.retained_audio_max_age_days * 86400, "retained"
+        cfg.retained_audio_dir,
+        cfg.retained_audio_max_age_days * 86400,
+        "retained",
+        # A held recording is kept until a human releases or deletes it: its
+        # content was never verified, so nothing has been delivered.
+        keep=_is_held,
     )
     # Also sweep the working directory. If record_call itself raises after a
     # partial flush, the caller never learns the path, so the fragment would
@@ -609,7 +686,19 @@ def prune_retained_audio(cfg: Config) -> int:
     return removed
 
 
-def _prune_dir(directory: str, max_age_seconds: float, label: str) -> int:
+def _is_held(path: str) -> bool:
+    """True for a held recording or its sidecar."""
+    sidecar = (
+        path if path.endswith(retained.SIDECAR_SUFFIX) else retained.sidecar_path(path)
+    )
+    try:
+        with open(sidecar, encoding="utf-8") as f:
+            return bool(json.load(f).get("held"))
+    except (OSError, ValueError):
+        return False
+
+
+def _prune_dir(directory: str, max_age_seconds: float, label: str, keep=None) -> int:
     if not os.path.isdir(directory):
         return 0
 
@@ -620,7 +709,7 @@ def _prune_dir(directory: str, max_age_seconds: float, label: str) -> int:
         try:
             # islink check keeps a symlink's target safe; only the link goes.
             if not os.path.islink(path) and os.path.isfile(path):
-                if os.path.getmtime(path) < cutoff:
+                if os.path.getmtime(path) < cutoff and not (keep and keep(path)):
                     os.unlink(path)
                     removed += 1
         except OSError:
@@ -685,6 +774,11 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
 
     log.info("Notetaker started. Polling every %ds...", cfg.poll_interval)
+    if not (cfg.alert_email and cfg.email_enabled):
+        log.warning(
+            "ALERT_EMAIL is not set (or email is off): a recording held by content "
+            "verification will only be logged, and nobody will be told"
+        )
     log.info("Email overrides: %s", cfg.email_overrides)
     if cfg.email_enabled:
         log.info("SMTP: %s:%d, from=%s", cfg.smtp_host, cfg.smtp_port, cfg.smtp_from)

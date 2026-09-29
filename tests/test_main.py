@@ -188,6 +188,7 @@ def test_finish_recording_dates_the_notes_by_the_call_not_the_retry(tmp_path):
         "name": "Call",
         "call_start": "2026-09-08T16:01:39",
         "speaker_events": [],
+        "recorded_s": 120.0,
     }
     audio = tmp_path / "a.webm"
     audio.write_bytes(b"x")

@@ -31,7 +31,8 @@ def _speech(chars_per_minute, minutes):
     """A transcript with the given density, in real [MM:SS] line format."""
     lines, total, i = [], chars_per_minute * minutes, 0
     while total > 0:
-        words = "word " * 20
+        # Distinct lines: repeated ones are counted once (hallucinations).
+        words = f"line {i} " + "word " * 20
         lines.append(f"[{i // 60:02d}:{i % 60:02d}] Neo: {words.strip()}")
         total -= len(words.strip())
         i += 10
@@ -39,7 +40,24 @@ def _speech(chars_per_minute, minutes):
 
 
 def test_speech_chars_ignores_timestamps():
-    assert speech_chars("[00:00] hello\n[01:05] Neo: yes") == len("hello\nNeo: yes")
+    assert speech_chars("[00:00] hello\n[01:05] Neo: yes") == len("hello" + "Neo: yes")
+
+
+def test_a_repeated_hallucination_counts_once():
+    """Whisper on silence: the same phrase every 30 seconds for an hour."""
+    lines = [
+        f"[{m:02d}:{s:02d}] Thanks for watching!" for m in range(78) for s in (0, 30)
+    ]
+    assert speech_chars("\n".join(lines)) == len("Thanks for watching!")
+    problems = check_content(_cfg(), NOTES, "\n".join(lines), 78 * 60, "x")
+    assert any("speech" in p for p in problems)
+
+
+def test_gemini_markers_are_not_speech():
+    transcript = (
+        "[NO SPEECH DETECTED]\n[SEGMENT 2 OF 6 UNAVAILABLE — covers minutes 15-30]"
+    )
+    assert speech_chars(transcript) == 0
 
 
 def test_the_2026_09_29_call_fails():
@@ -65,7 +83,7 @@ def test_no_speech_on_a_long_call_fails():
     problems = check_content(
         _cfg(), NOTES, NO_SPEECH_SENTINEL, 40 * 60, NO_SPEECH_SENTINEL
     )
-    assert problems and "0 characters of speech" in problems[0]
+    assert problems and problems[0].startswith("only 0 characters of speech")
 
 
 def test_short_calls_are_not_judged_on_speech():
@@ -80,13 +98,26 @@ def test_empty_notes_fail_even_with_good_speech():
     assert problems == ["the notes are empty (7 characters)"]
 
 
-def test_gemini_path_without_transcript_is_judged_on_notes_only():
-    assert check_content(_cfg(), NOTES, None, 60 * 60, "x") == []
-    assert check_content(_cfg(), "", None, 60 * 60, "x")
+def test_no_transcript_on_a_long_call_fails_closed():
+    """Gemini single-pass writes notes straight from audio: nothing to check
+    them against, so they are not trusted."""
+    problems = check_content(_cfg(), NOTES, None, 60 * 60, "x")
+    assert problems and "no transcript" in problems[0]
 
 
-def test_unknown_duration_skips_the_speech_check():
-    assert check_content(_cfg(), NOTES, "[00:00] hi", None, "x") == []
+def test_no_transcript_on_a_short_call_is_judged_on_notes_only():
+    assert check_content(_cfg(), NOTES, None, 4 * 60, "x") == []
+    assert check_content(_cfg(), "", None, 4 * 60, "x")
+
+
+def test_short_calls_with_sparse_speech_pass():
+    assert check_content(_cfg(), NOTES, "[00:03] ok bye", 4 * 60, "x") == []
+
+
+def test_unknown_duration_fails_closed():
+    assert check_content(_cfg(), NOTES, _speech(500, 30), None, "x") == [
+        "the length of the recording could not be read"
+    ]
 
 
 def test_thresholds_are_configurable():
@@ -312,3 +343,131 @@ def test_a_failed_release_keeps_the_recording_and_what_was_done(tmp_path, monkey
         sidecar = json.load(f)
     assert sidecar["email_done"] is True  # a second release must not re-send
     assert email.call_count == 1
+
+
+def test_the_alert_names_the_exact_held_file(tmp_path):
+    cfg = _pipeline_cfg(tmp_path)
+    _, held, mocks = _run_call(cfg, tmp_path, SILENT)
+    body = mocks["email"].call_args.args[1]["body"]
+    assert f"--release /data/notes/retained-audio/{os.path.basename(held)}" in body
+
+
+def test_held_recordings_are_never_pruned(tmp_path):
+    from notetaker.main import prune_retained_audio
+
+    cfg = _pipeline_cfg(tmp_path, retained_audio_max_age_days=30)
+    _, held, _ = _run_call(cfg, tmp_path, SILENT)
+    ordinary = os.path.join(cfg.retained_audio_dir, "abc-2026-08-01-x.webm")
+    with open(ordinary, "wb") as f:
+        f.write(b"a")
+    old = 1_000_000_000
+    for path in (held, retained.sidecar_path(held), ordinary):
+        os.utime(path, (old, old))
+    prune_retained_audio(cfg)
+    assert os.path.exists(held) and os.path.exists(retained.sidecar_path(held))
+    assert not os.path.exists(ordinary)
+
+
+def test_an_unreadable_length_falls_back_to_time_in_the_call(tmp_path):
+    from notetaker.main import _verify_content
+
+    meta = {"transcript": "[00:00] Thanks for watching!", "recorded_s": 78 * 60.0}
+    with patch(
+        "notetaker.transcriber._get_audio_duration", side_effect=RuntimeError("x")
+    ):
+        problems = _verify_content(_cfg(), meta, "/nope.webm", NOTES)
+    assert meta["duration_s"] == 78 * 60.0
+    assert any("speech" in p for p in problems)
+
+
+def test_an_already_published_recording_is_not_held_on_retry(tmp_path):
+    from notetaker.main import _verify_content
+
+    for done in ({"notes_saved": True}, {"email_done": True}):
+        meta = {"transcript": "[00:00] hi", "duration_s": 3600.0, **done}
+        assert _verify_content(_cfg(), meta, "/nope.webm", NOTES) == []
+
+
+def test_gemini_segment_transcripts_are_checked(tmp_path):
+    """The chunked Gemini path hands its segment transcripts to the check."""
+    from notetaker.transcriber import make_notes
+
+    cfg = _cfg(transcription_backend="gemini")
+    meta = {}
+
+    def fake(*args, transcript_sink=None, **kwargs):
+        transcript_sink.extend(["[NO SPEECH DETECTED]", "[NO SPEECH DETECTED]"])
+        return NOTES
+
+    with patch("notetaker.transcriber.transcribe_and_summarize", side_effect=fake):
+        make_notes(cfg, meta, "/a.webm", "Talk", "2026-09-29")
+    assert meta["gemini_transcript"] == "[NO SPEECH DETECTED]\n[NO SPEECH DETECTED]"
+
+    from notetaker.main import _verify_content
+
+    meta["duration_s"] = 60 * 60.0
+    assert _verify_content(cfg, meta, "/a.webm", NOTES)
+
+
+def test_plain_reprocess_refuses_to_publish_a_held_call(tmp_path, monkeypatch):
+    from notetaker import reprocess
+
+    cfg = _pipeline_cfg(tmp_path)
+    _, held, _ = _run_call(cfg, tmp_path, SILENT)
+    _release_env(monkeypatch)
+    with (
+        patch("notetaker.reprocess.upload_notes") as upload,
+        patch("notetaker.reprocess.make_notes") as make,
+    ):
+        assert reprocess.main([held]) == 1
+    upload.assert_not_called()
+    make.assert_not_called()
+    assert os.path.exists(held)
+
+
+def test_an_empty_recording_with_attendees_alerts(tmp_path):
+    from notetaker.main import handle_call
+
+    cfg = _pipeline_cfg(tmp_path)
+    audio = tmp_path / "work" / "2026-09-29-talk.webm"
+    audio.parent.mkdir()
+    audio.write_bytes(b"")
+    rec = MagicMock()
+    rec.record_call = AsyncMock(return_value=(str(audio), [], {"piyush"}))
+    with (
+        patch("notetaker.main.deliver_notes", return_value=True) as email,
+        patch("notetaker.main.AudioRecorder", return_value=rec),
+    ):
+        asyncio.run(handle_call(cfg, {"token": "itujzrjw", "displayName": "Talk"}))
+    [envelope] = [c.args[1] for c in email.call_args_list]
+    assert [r["email"] for r in envelope["recipients"]] == ["neo@x.com"]
+    assert "no audio" in envelope["subject"].lower()
+
+
+def test_a_failed_release_is_left_for_the_automatic_retry(tmp_path, monkeypatch):
+    from notetaker import reprocess
+
+    cfg = _pipeline_cfg(tmp_path)
+    _, held, _ = _run_call(cfg, tmp_path, SILENT)
+    _release_env(monkeypatch)
+    monkeypatch.setenv("STATE_DIR", cfg.state_dir)
+    with (
+        patch("notetaker.main.upload_notes", side_effect=RuntimeError("502")),
+        patch("notetaker.main.deliver_notes", return_value=True),
+    ):
+        assert reprocess.main([held, "--release"]) == 1
+    with open(retained.sidecar_path(held), encoding="utf-8") as f:
+        sidecar = json.load(f)
+    assert "parked" not in sidecar and sidecar["content_accepted"] is True
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"min_speech_chars_per_minute": -1},
+        {"verify_min_minutes": -1},
+        {"alert_email": "neo"},
+    ],
+)
+def test_bad_verification_settings_are_refused(overrides):
+    assert _cfg(**overrides).validate()

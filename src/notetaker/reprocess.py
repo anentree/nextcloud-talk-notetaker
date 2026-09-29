@@ -103,7 +103,11 @@ def release(cfg: Config, audio_path: str) -> int:
         # so running this again cannot email the attendees twice.
         retained._atomic_write(path, meta)
     if not ok:
-        log.error("Released, but the notes or transcript could not be saved; kept")
+        log.error(
+            "Released, but the notes or transcript could not be saved. The "
+            "recording is kept and the notetaker will retry it on its own; do "
+            "not run --release again"
+        )
         return 1
     for leftover in (audio_path, path):
         try:
@@ -170,6 +174,16 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     meta = _load_sidecar(args.audio_path)
+    if meta.get("held") and not (args.dry_run or args.out):
+        # Uploading here would publish notes that failed verification into
+        # the shared folder. Only --release is a decision to do that.
+        log.error(
+            "%s is HELD by content verification (%s). Use --release to publish "
+            "it anyway, or --dry-run/--out to look at it",
+            args.audio_path,
+            "; ".join(meta["held"]),
+        )
+        return 1
     notes = make_notes(
         cfg,
         meta,

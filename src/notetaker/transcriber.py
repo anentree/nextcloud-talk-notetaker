@@ -683,8 +683,13 @@ def make_notes(
     """
     speaker_events = meta.get("speaker_events") or []
     transcript = meta.get("transcript")
-    if transcript is None and cfg.transcription_backend != "whisper":
-        return transcribe_and_summarize(
+
+    def gemini_audio_notes(call_date):
+        # Gemini's segment transcripts are not verbatim, so they are kept
+        # apart from meta["transcript"]; verify.py checks the notes against
+        # them. A short call is transcribed in one pass and leaves none.
+        sink: list[str] = []
+        notes = transcribe_and_summarize(
             cfg.gemini_api_key,
             audio_path,
             conversation_name,
@@ -693,7 +698,13 @@ def make_notes(
             participant_names=participant_names,
             heartbeat_fn=heartbeat_fn,
             call_date=call_date,
+            transcript_sink=sink,
         )
+        meta["gemini_transcript"] = "\n".join(sink) if sink else None
+        return notes
+
+    if transcript is None and cfg.transcription_backend != "whisper":
+        return gemini_audio_notes(call_date)
 
     call_date = call_date or date.today().isoformat()
     duration_min = int(_get_audio_duration(audio_path) / 60)
@@ -732,16 +743,7 @@ def make_notes(
                 failures,
                 attempts,
             )
-            return transcribe_and_summarize(
-                cfg.gemini_api_key,
-                audio_path,
-                conversation_name,
-                model=cfg.gemini_model,
-                speaker_events=speaker_events,
-                participant_names=participant_names,
-                heartbeat_fn=heartbeat_fn,
-                call_date=call_date,
-            )
+            return gemini_audio_notes(call_date)
         try:
             segments = whisper_transcribe(
                 audio_path,
@@ -803,8 +805,12 @@ def transcribe_and_summarize(
     participant_names: list[str] | None = None,
     heartbeat_fn=None,
     call_date: str | None = None,
+    transcript_sink: list[str] | None = None,
 ) -> str:
     """Transcribe audio via chunked pipeline: split → transcribe segments → synthesize notes.
+
+    ``transcript_sink``, when given, receives each segment's transcript, so
+    the caller can check the notes against what was actually heard.
 
     ``heartbeat_fn`` is called between chunks. Transcribing a long call takes
     many minutes on the single-threaded poll loop, and without it the
@@ -978,6 +984,8 @@ def transcribe_and_summarize(
                     f"Transcription failed: {exc}]"
                 )
             segment_texts.append(text)
+            if transcript_sink is not None:
+                transcript_sink.append(text)
             # Brief pause between API calls to avoid rate limits
             if i < len(chunks) - 1:
                 time.sleep(2)
