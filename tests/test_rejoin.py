@@ -53,7 +53,8 @@ def test_presence_counts_the_bot_in_call_when_its_flag_is_set():
 
 
 def _join_tracking_page():
-    """A Playwright stack whose join buttons count their clicks."""
+    """A Playwright stack whose top-bar join button and media-settings dialog
+    count their clicks separately. By default no dialog ever appears."""
     recorder = _make_recorder()
     pw_ctx, page, _ = _mock_playwright_stack()
     type(page).url = PropertyMock(return_value="https://nc.example.com/apps/dashboard/")
@@ -62,10 +63,20 @@ def _join_tracking_page():
     join.first.click = AsyncMock()
     join.first.is_visible = AsyncMock(return_value=False)
     join.count = AsyncMock(return_value=0)
-    original = page.locator
     join.selectors = []
+    dialog = MagicMock()
+    dialog.first = AsyncMock()
+    dialog.first.click = AsyncMock()
+    dialog.first.is_visible = AsyncMock(return_value=False)
+    dialog.first.wait_for = AsyncMock(side_effect=TimeoutError("no dialog"))
+    dialog.selectors = []
+    join.dialog = dialog
+    original = page.locator
 
     def locator(selector):
+        if ".media-settings" in selector:
+            dialog.selectors.append(selector)
+            return dialog
         if "Join call" in selector or "Start call" in selector:
             join.selectors.append(selector)
             return join
@@ -76,8 +87,10 @@ def _join_tracking_page():
     return recorder, pw_ctx, join
 
 
-async def _record(presence_sequence):
+async def _record(presence_sequence, setup=None):
     recorder, pw_ctx, join = _join_tracking_page()
+    if setup:
+        setup(join)
     ended = (set(), 0, True)
     seq = iter(presence_sequence)
     with (
@@ -154,3 +167,68 @@ async def test_a_rejoin_can_never_click_leave_call():
     join = await _record([here, dropped, dropped, here])
     top_bar = [sel for sel in join.selectors if "top-bar" in sel]
     assert len(top_bar) == 1  # the first join only
+
+
+@pytest.mark.asyncio
+async def test_being_seen_back_in_the_call_resets_the_count():
+    here = ({"neo"}, 1, True)
+    dropped = ({"neo"}, 1, False)
+    join = await _record([dropped, here, dropped, here])
+    assert join.first.click.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_poll_neither_counts_nor_resets():
+    dropped = ({"neo"}, 1, False)
+    join = await _record([dropped, None, dropped, ({"neo"}, 1, True)])
+    assert join.first.click.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_bot_alone_after_the_call_ends_never_rejoins():
+    """With nobody else in the call, clicking would start a new call and
+    ring the whole room."""
+    alone = (set(), 0, False)
+    join = await _record([alone] * 8)
+    assert join.first.click.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_rejoin_never_clicks_start_call():
+    here = ({"neo"}, 1, True)
+    dropped = ({"neo"}, 1, False)
+    join = await _record([here, dropped, dropped, here])
+    # Each join builds a top-bar locator and a fallback locator.
+    first, rejoin = join.selectors[:2], join.selectors[2:]
+    assert all("Start call" in sel for sel in first)  # the check can see it
+    assert len(rejoin) == 2
+    assert all("Start call" not in sel for sel in rejoin)
+    assert "Start call" in join.dialog.selectors[0]
+    assert all("Start call" not in sel for sel in join.dialog.selectors[1:])
+
+
+@pytest.mark.asyncio
+async def test_a_rejoin_clicks_through_the_media_settings_dialog():
+    here = ({"neo"}, 1, True)
+    dropped = ({"neo"}, 1, False)
+
+    def dialog_appears(join):
+        join.dialog.first.wait_for = AsyncMock()
+
+    join = await _record([here, dropped, dropped, here], setup=dialog_appears)
+    # Once for the first join, once for the rejoin.
+    assert join.dialog.first.click.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_dialog_left_open_is_clicked_instead_of_the_covered_button():
+    """A dialog that rendered late and was missed stays open over the top
+    bar; the next rejoin must click the dialog, not the covered button."""
+    dropped = ({"neo"}, 1, False)
+
+    def dialog_left_open(join):
+        join.dialog.first.is_visible = AsyncMock(return_value=True)
+
+    join = await _record([dropped, dropped, ({"neo"}, 1, True)], setup=dialog_left_open)
+    assert join.first.click.await_count == 1  # the first join only
+    assert join.dialog.first.click.await_count == 1

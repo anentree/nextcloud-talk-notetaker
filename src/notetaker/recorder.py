@@ -284,6 +284,7 @@ AUDIO_CAPTURE_INIT_JS = """
         // subscriber connections both reporting track.id "janus0" produce
         // distinct keys ("1:janus0", "2:janus0") instead of colliding.
         pc.__nt_pcId = window.__notetaker_pc_count;
+        (window.__nt_pcs = window.__nt_pcs || []).push(pc);
         console.log('[notetaker] Hooked PeerConnection #' + pc.__nt_pcId +
             ' signalingState=' + pc.signalingState);
 
@@ -441,6 +442,22 @@ AUDIO_CAPTURE_INIT_JS = """
     console.log('[notetaker] Audio hooks installed (prototype + proxy + gUM)');
 })();
 """
+
+# Polled every 10s during a call. liveAudio counts remote audio tracks that
+# are live and not muted on connections that are still up; the bot's own
+# publisher connection has only muted receivers, so it does not count.
+AUDIO_STATUS_JS = """() => ({
+    hasRecorder: window.__notetaker_recorder !== null,
+    chunks: window.__notetaker_chunks.length,
+    pcCount: window.__notetaker_pc_count || 0,
+    trackCount: window.__notetaker_track_count || 0,
+    ctxState: window.__notetaker_ctx ? window.__notetaker_ctx.state : 'none',
+    liveAudio: (window.__nt_pcs || [])
+        .filter(pc => pc.connectionState !== 'closed' && pc.connectionState !== 'failed')
+        .reduce((n, pc) => n + pc.getReceivers().filter(r => r.track &&
+            r.track.kind === 'audio' && r.track.readyState === 'live' &&
+            !r.track.muted).length, 0),
+})"""
 
 # JavaScript to flush accumulated audio chunks as base64 and clear the buffer.
 # Called periodically during recording to bound browser memory usage.
@@ -855,20 +872,50 @@ class AudioRecorder:
     async def _join_call(self, page, rejoin: bool = False) -> None:
         """Click through Talk's join flow. Used for the first join and to
         rejoin a call the bot was dropped from; raises if no join button
-        appears."""
+        appears.
+
+        A rejoin only ever clicks "Join call": the call is known to be
+        running, so "Start call" could only appear in a race with the call
+        ending, and clicking it would start a new call that rings the room.
+        """
+        # Click the actual "Join call" button inside the dialog
+        # (audio/video are already muted at the getUserMedia level)
+        dialog_texts = ("Join call",) if rejoin else ("Join call", "Start call")
+        dialog_join = page.locator(
+            ",".join(
+                f'{scope} button:has-text("{text}")'
+                for scope in (".media-settings", ".modal-container")
+                for text in dialog_texts
+            )
+            + ","
+            + ",".join(
+                f'[class*="call-button"]:has-text("{text}")' for text in dialog_texts
+            )
+        )
+        if rejoin and await dialog_join.first.is_visible():
+            # A previous attempt opened the media-settings dialog and missed
+            # it. The top-bar button is under its overlay now, so clicking
+            # that would time out on every attempt for the rest of the call.
+            await dialog_join.first.click()
+            log.info("Clicked the Join call button of an already open dialog")
+            return
+
         # Join the call — Talk has a two-step process:
         # 1. Click "Join call" in the top bar → opens media settings dialog
         # 2. Click "Join call" inside the dialog → actually joins the call
-        selector = (
-            'button:has-text("Join call"),'
-            ' button:has-text("Start call"),'
-            ' [data-tooltip="Join call"],'
-            ' [data-tooltip="Start call"]'
-        )
-        if not rejoin:
-            # Catch-all for a relabelled button. Never on a rejoin: if the bot
-            # is in fact still in the call, this matches "Leave call".
-            selector += ', .top-bar button[aria-label*="call" i]'
+        if rejoin:
+            selector = 'button:has-text("Join call"), [data-tooltip="Join call"]'
+        else:
+            selector = (
+                'button:has-text("Join call"),'
+                ' button:has-text("Start call"),'
+                ' [data-tooltip="Join call"],'
+                ' [data-tooltip="Start call"],'
+                # Catch-all for a relabelled button. Never on a rejoin: if
+                # the bot is in fact still in the call, this matches "Leave
+                # call".
+                ' .top-bar button[aria-label*="call" i]'
+            )
         join_btn = page.locator(selector)
         await join_btn.first.click(timeout=30000)
         log.info("Clicked initial Join call button")
@@ -876,27 +923,19 @@ class AudioRecorder:
         # Wait for media settings dialog to appear
         await asyncio.sleep(3)
 
-        # Click the actual "Join call" button inside the dialog
-        # (audio/video are already muted at the getUserMedia level)
-        dialog_join = page.locator(
-            '.media-settings button:has-text("Join call"),'
-            ' .media-settings button:has-text("Start call"),'
-            ' .modal-container button:has-text("Join call"),'
-            ' .modal-container button:has-text("Start call"),'
-            ' [class*="call-button"]:has-text("Join call"),'
-            ' [class*="call-button"]:has-text("Start call")'
-        )
         try:
-            if await dialog_join.first.is_visible(timeout=5000):
-                await dialog_join.first.click()
-                log.info("Clicked dialog Join call button (media settings)")
-            else:
-                log.info("No media settings dialog found, may have joined directly")
+            # is_visible() ignores its timeout and answers immediately; a
+            # dialog that rendered a moment late was reported as "joined
+            # directly" and left open. wait_for really waits.
+            await dialog_join.first.wait_for(state="visible", timeout=5000)
+            await dialog_join.first.click()
+            log.info("Clicked dialog Join call button (media settings)")
         except Exception:
+            log.info("No media settings dialog found, may have joined directly")
             # Try clicking any remaining visible join button
             try:
                 all_join = page.locator(
-                    'button:has-text("Join call"), button:has-text("Start call")'
+                    ", ".join(f'button:has-text("{text}")' for text in dialog_texts)
                 )
                 count = await all_join.count()
                 log.info("Found %d join buttons after dialog check", count)
@@ -908,6 +947,17 @@ class AudioRecorder:
                         break
             except Exception:
                 log.info("No additional join buttons found")
+
+    async def _call_button_labels(self, page) -> list[str]:
+        """Labels of the call buttons on the page, for a failed rejoin's log."""
+        try:
+            return await page.evaluate(
+                """() => Array.from(document.querySelectorAll('button'))
+                    .map(b => (b.getAttribute('aria-label') || b.textContent || '').trim())
+                    .filter(t => /call/i.test(t)).slice(0, 10)"""
+            )
+        except Exception:
+            return []
 
     async def record_call(
         self, room_token: str, conversation_name: str
@@ -1143,6 +1193,7 @@ class AudioRecorder:
             # Two in a row (20s) is a drop; one can be the flag lagging.
             dropped_streak = 0
             rejoins = 0
+            silent_streak = 0
             while True:
                 await asyncio.sleep(10)
                 poll_count += 1
@@ -1157,22 +1208,14 @@ class AudioRecorder:
                     except Exception:
                         log.debug("Heartbeat callback failed", exc_info=True)
 
+                diag = await page.evaluate(AUDIO_STATUS_JS)
+                diag = diag if isinstance(diag, dict) else {}
                 # Log diagnostics every 3rd poll (30s)
                 if poll_count % 3 == 1:
-                    diag = await page.evaluate("""() => ({
-                        hasRecorder: window.__notetaker_recorder !== null,
-                        chunks: window.__notetaker_chunks.length,
-                        pcCount: window.__notetaker_pc_count || 0,
-                        trackCount: window.__notetaker_track_count || 0,
-                        ctxState: window.__notetaker_ctx ? window.__notetaker_ctx.state : 'none',
-                    })""")
                     log.info("Audio status: %s", diag)
-                else:
-                    has_recorder = await page.evaluate(
-                        "() => window.__notetaker_recorder !== null"
-                    )
-                    if not has_recorder:
-                        log.debug("Still waiting for remote audio tracks...")
+                elif not diag.get("hasRecorder"):
+                    log.debug("Still waiting for remote audio tracks...")
+                live_audio = diag.get("liveAudio")
 
                 # Flush audio chunks to disk every 5 minutes (30 polls × 10s)
                 if poll_count % 30 == 0:
@@ -1201,9 +1244,12 @@ class AudioRecorder:
                     # The check failed — treat as "still active" rather than
                     # ending the recording on a transient API error.
                     others_present = 1
-                    self_in_call = True
+                    self_in_call = None
 
-                if others_present and not self_in_call:
+                if self_in_call is None:
+                    # Unknown: neither evidence of a drop nor of being back.
+                    pass
+                elif others_present and not self_in_call:
                     dropped_streak += 1
                     if dropped_streak >= 2:
                         dropped_streak = 0
@@ -1217,16 +1263,36 @@ class AudioRecorder:
                         )
                         try:
                             await self._join_call(page, rejoin=True)
-                        except Exception as exc:
+                        except Exception as exc:  # noqa: BLE001 — keep recording
                             log.error(
-                                "Rejoin #%d failed in room %s: %s: %s",
+                                "Rejoin #%d failed in room %s: %s: %s "
+                                "(call buttons on the page: %s)",
                                 rejoins,
                                 room_token,
                                 type(exc).__name__,
                                 exc,
+                                await self._call_button_labels(page),
                             )
                 else:
                     dropped_streak = 0
+
+                # Talk can still list the bot as in the call while its media
+                # is dead. Only reported, not acted on: whether Chrome mutes a
+                # remote track reliably when its RTP stops is unproven, and a
+                # false alarm would make the bot leave and rejoin mid-call.
+                # verify.py holds a recording that came out silent.
+                if others_present and self_in_call and live_audio == 0:
+                    silent_streak += 1
+                    if silent_streak == 6:
+                        log.warning(
+                            "No live remote audio for 60s in room %s while %d "
+                            "other(s) are in the call (status %s)",
+                            room_token,
+                            others_present,
+                            diag,
+                        )
+                else:
+                    silent_streak = 0
 
                 if not others_present:
                     empty_streak += 1
