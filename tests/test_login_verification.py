@@ -192,7 +192,7 @@ async def test_successful_login_proceeds():
     # Make presence report an empty call immediately (call ended)
     with (
         patch("playwright.async_api.async_playwright", return_value=pw_ctx),
-        patch("notetaker.recorder._call_presence", return_value=(set(), 0), create=True),
+        patch("notetaker.recorder._call_presence", return_value=(set(), 0, True), create=True),
     ):
         # Should complete without raising
         page.evaluate = _evaluate_dispatcher()
@@ -212,7 +212,7 @@ async def test_login_waits_for_form_elements():
 
     with (
         patch("playwright.async_api.async_playwright", return_value=pw_ctx),
-        patch("notetaker.recorder._call_presence", return_value=(set(), 0), create=True),
+        patch("notetaker.recorder._call_presence", return_value=(set(), 0, True), create=True),
     ):
         page.evaluate = _evaluate_dispatcher()
         await recorder.record_call("room123", "Test Call")

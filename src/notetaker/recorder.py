@@ -759,8 +759,9 @@ def resolve_stream_labels(
 
 def _call_presence(
     base_url: str, auth: tuple, room_token: str, own_user: str
-) -> tuple[set[str], int] | None:
-    """Return (registered user IDs in the call, total others in the call).
+) -> tuple[set[str], int, bool] | None:
+    """Return (registered user IDs in the call, total others in the call,
+    whether the bot itself is in the call).
 
     Returns None if the check itself failed, which callers must treat as
     "unknown", not as "nobody is here".
@@ -778,6 +779,11 @@ def _call_presence(
     participant's ``inCall`` flag resets to 0, so who was actually present
     cannot be recovered afterwards — which is why the caller accumulates the
     union of these sets across the whole call.
+
+    The bot's own flag is how the caller notices it was dropped from a call
+    that is still running (2026-09-29: an SFU teardown when one participant
+    lost connection took the bot out of the call, and it recorded 77 minutes
+    of silence while the others talked).
     """
     try:
         resp = requests.get(
@@ -789,9 +795,11 @@ def _call_presence(
         resp.raise_for_status()
         ids: set[str] = set()
         total = 0
+        self_in_call = False
         for p in resp.json()["ocs"]["data"]:
             actor_id = p.get("actorId")
             if actor_id == own_user:
+                self_in_call = self_in_call or p.get("inCall", 0) > 0
                 continue
             if not p.get("inCall", 0) > 0:
                 continue
@@ -800,7 +808,7 @@ def _call_presence(
             # value as a registered user rather than dropping the attendee.
             if p.get("actorType", "users") == "users" and actor_id:
                 ids.add(actor_id)
-        return ids, total
+        return ids, total, self_in_call
     except Exception:
         log.warning("Failed to check call participants via API, assuming still active")
         return None
@@ -843,6 +851,63 @@ class AudioRecorder:
 
     # Set by the caller so the recorder can prove liveness during a long call.
     heartbeat_fn = None
+
+    async def _join_call(self, page, rejoin: bool = False) -> None:
+        """Click through Talk's join flow. Used for the first join and to
+        rejoin a call the bot was dropped from; raises if no join button
+        appears."""
+        # Join the call — Talk has a two-step process:
+        # 1. Click "Join call" in the top bar → opens media settings dialog
+        # 2. Click "Join call" inside the dialog → actually joins the call
+        selector = (
+            'button:has-text("Join call"),'
+            ' button:has-text("Start call"),'
+            ' [data-tooltip="Join call"],'
+            ' [data-tooltip="Start call"]'
+        )
+        if not rejoin:
+            # Catch-all for a relabelled button. Never on a rejoin: if the bot
+            # is in fact still in the call, this matches "Leave call".
+            selector += ', .top-bar button[aria-label*="call" i]'
+        join_btn = page.locator(selector)
+        await join_btn.first.click(timeout=30000)
+        log.info("Clicked initial Join call button")
+
+        # Wait for media settings dialog to appear
+        await asyncio.sleep(3)
+
+        # Click the actual "Join call" button inside the dialog
+        # (audio/video are already muted at the getUserMedia level)
+        dialog_join = page.locator(
+            '.media-settings button:has-text("Join call"),'
+            ' .media-settings button:has-text("Start call"),'
+            ' .modal-container button:has-text("Join call"),'
+            ' .modal-container button:has-text("Start call"),'
+            ' [class*="call-button"]:has-text("Join call"),'
+            ' [class*="call-button"]:has-text("Start call")'
+        )
+        try:
+            if await dialog_join.first.is_visible(timeout=5000):
+                await dialog_join.first.click()
+                log.info("Clicked dialog Join call button (media settings)")
+            else:
+                log.info("No media settings dialog found, may have joined directly")
+        except Exception:
+            # Try clicking any remaining visible join button
+            try:
+                all_join = page.locator(
+                    'button:has-text("Join call"), button:has-text("Start call")'
+                )
+                count = await all_join.count()
+                log.info("Found %d join buttons after dialog check", count)
+                for i in range(count):
+                    btn = all_join.nth(i)
+                    if await btn.is_visible():
+                        await btn.click()
+                        log.info("Clicked visible join button #%d", i)
+                        break
+            except Exception:
+                log.info("No additional join buttons found")
 
     async def record_call(
         self, room_token: str, conversation_name: str
@@ -1033,55 +1098,7 @@ class AudioRecorder:
             })""")
             log.info("Pre-join diagnostics: %s", pre_diag)
 
-            # Join the call — Talk has a two-step process:
-            # 1. Click "Join call" in the top bar → opens media settings dialog
-            # 2. Click "Join call" inside the dialog → actually joins the call
-            join_btn = page.locator(
-                'button:has-text("Join call"),'
-                ' button:has-text("Start call"),'
-                ' [data-tooltip="Join call"],'
-                ' [data-tooltip="Start call"],'
-                ' .top-bar button[aria-label*="call" i]'
-            )
-            await join_btn.first.click(timeout=30000)
-            log.info("Clicked initial Join call button")
-
-            # Wait for media settings dialog to appear
-            await asyncio.sleep(3)
-
-            # Click the actual "Join call" button inside the dialog
-            # (audio/video are already muted at the getUserMedia level)
-            dialog_join = page.locator(
-                '.media-settings button:has-text("Join call"),'
-                ' .media-settings button:has-text("Start call"),'
-                ' .modal-container button:has-text("Join call"),'
-                ' .modal-container button:has-text("Start call"),'
-                ' [class*="call-button"]:has-text("Join call"),'
-                ' [class*="call-button"]:has-text("Start call")'
-            )
-            try:
-                if await dialog_join.first.is_visible(timeout=5000):
-                    await dialog_join.first.click()
-                    log.info("Clicked dialog Join call button (media settings)")
-                else:
-                    log.info("No media settings dialog found, may have joined directly")
-            except Exception:
-                # Try clicking any remaining visible join button
-                try:
-                    all_join = page.locator(
-                        'button:has-text("Join call"), button:has-text("Start call")'
-                    )
-                    count = await all_join.count()
-                    log.info("Found %d join buttons after dialog check", count)
-                    for i in range(count):
-                        btn = all_join.nth(i)
-                        if await btn.is_visible():
-                            await btn.click()
-                            log.info("Clicked visible join button #%d", i)
-                            break
-                except Exception:
-                    log.info("No additional join buttons found")
-
+            await self._join_call(page)
             log.info("Join sequence complete for room %s", room_token)
 
             # Wait for WebRTC to connect — SFU via HPB can take 10-15s
@@ -1122,6 +1139,10 @@ class AudioRecorder:
             # Union of everyone seen in the call across its whole lifetime.
             # Someone who joined for five minutes and left still attended.
             attendee_ids: set[str] = set()
+            # Consecutive polls with others in the call and the bot not.
+            # Two in a row (20s) is a drop; one can be the flag lagging.
+            dropped_streak = 0
+            rejoins = 0
             while True:
                 await asyncio.sleep(10)
                 poll_count += 1
@@ -1171,7 +1192,7 @@ class AudioRecorder:
                     self.nextcloud_url, auth, room_token, self.user
                 )
                 if presence is not None:
-                    current_ids, others_present = presence
+                    current_ids, others_present, self_in_call = presence
                     new_ids = current_ids - attendee_ids
                     if new_ids:
                         log.info("Attendees joined the call: %s", sorted(new_ids))
@@ -1180,6 +1201,32 @@ class AudioRecorder:
                     # The check failed — treat as "still active" rather than
                     # ending the recording on a transient API error.
                     others_present = 1
+                    self_in_call = True
+
+                if others_present and not self_in_call:
+                    dropped_streak += 1
+                    if dropped_streak >= 2:
+                        dropped_streak = 0
+                        rejoins += 1
+                        log.warning(
+                            "Bot is no longer in the call in room %s while %d "
+                            "other(s) are; rejoining (rejoin #%d)",
+                            room_token,
+                            others_present,
+                            rejoins,
+                        )
+                        try:
+                            await self._join_call(page, rejoin=True)
+                        except Exception as exc:
+                            log.error(
+                                "Rejoin #%d failed in room %s: %s: %s",
+                                rejoins,
+                                room_token,
+                                type(exc).__name__,
+                                exc,
+                            )
+                else:
+                    dropped_streak = 0
 
                 if not others_present:
                     empty_streak += 1

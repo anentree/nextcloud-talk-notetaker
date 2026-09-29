@@ -164,7 +164,7 @@ def test_guest_only_call_is_still_considered_active():
         },
         status=200,
     )
-    ids, total = _call_presence(NEXTCLOUD_URL, ("bot", "s"), "abc123", "bot")
+    ids, total, _ = _call_presence(NEXTCLOUD_URL, ("bot", "s"), "abc123", "bot")
     assert total == 1, "guest counts as present"
     assert ids == set(), "but guests are not emailable recipients"
     assert _others_in_call(NEXTCLOUD_URL, ("bot", "s"), "abc123", "bot") is True
@@ -179,7 +179,7 @@ def test_missing_actor_type_is_treated_as_a_user():
         json={"ocs": {"data": [{"actorId": "alice", "inCall": 7}]}},
         status=200,
     )
-    ids, total = _call_presence(NEXTCLOUD_URL, ("bot", "s"), "abc123", "bot")
+    ids, total, _ = _call_presence(NEXTCLOUD_URL, ("bot", "s"), "abc123", "bot")
     assert ids == {"alice"}
     assert total == 1
 
@@ -242,7 +242,7 @@ async def test_room_member_never_seen_in_call_is_not_named_onto_a_track():
     with (
         responses.RequestsMock() as rsps,
         patch("playwright.async_api.async_playwright", return_value=pw_ctx),
-        patch("notetaker.recorder._call_presence", return_value=(set(), 0)),
+        patch("notetaker.recorder._call_presence", return_value=(set(), 0, True)),
         patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
     ):
         rsps.get(_ROOM_ENDPOINT, json={"ocs": {"data": _ROSTER}}, status=200)
