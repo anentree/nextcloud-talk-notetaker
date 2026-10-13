@@ -267,3 +267,34 @@ def test_no_notifications_204_is_not_an_error(caplog):
     with caplog.at_level("WARNING"):
         assert CallMonitor(NEXTCLOUD_URL, "bot", "secret").check_for_new_calls() == []
     assert "Could not fetch call notifications" not in caplog.text
+
+
+@responses.activate
+def test_other_call_waiting_ignores_the_current_room():
+    responses.get(
+        ROOMS_ENDPOINT,
+        json={
+            "ocs": {
+                "data": [
+                    make_room("mine", "A", has_call=True),
+                    make_room("idle", "B", has_call=False),
+                ]
+            }
+        },
+        status=200,
+    )
+    responses.get(
+        ROOMS_ENDPOINT,
+        json={
+            "ocs": {
+                "data": [
+                    make_room("mine", "A", has_call=True),
+                    make_room("next", "C", has_call=True),
+                ]
+            }
+        },
+        status=200,
+    )
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    assert monitor.other_call_waiting("mine") is False
+    assert monitor.other_call_waiting("mine") is True

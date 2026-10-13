@@ -155,13 +155,15 @@ def _build_notes_filename(
     return f"{date_str}-{time_str}-{names_slug}.md"
 
 
-async def handle_call(cfg: Config, room: dict) -> None:
+async def handle_call(cfg: Config, room: dict, monitor=None) -> None:
     """Record one call and process it, start to finish."""
-    meta, audio_path = await record_call(cfg, room)
+    meta, audio_path = await record_call(cfg, room, monitor)
     await finish_call(cfg, meta, audio_path)
 
 
-async def record_call(cfg: Config, room: dict) -> tuple[dict, str]:
+async def record_call(
+    cfg: Config, room: dict, monitor=None
+) -> tuple[dict, str]:
     """Join and record a call. Returns the context the rest of the pipeline
     needs and the audio path. Only this part has to hold the poll loop: the
     transcription that follows can run while the next call is being joined."""
@@ -181,6 +183,8 @@ async def record_call(cfg: Config, room: dict) -> tuple[dict, str]:
     # A call blocks the outer poll loop, so the recorder keeps the heartbeat
     # fresh on our behalf.
     recorder.heartbeat_fn = lambda: _touch_heartbeat(cfg)
+    if monitor is not None:
+        recorder.other_call_waiting_fn = lambda: monitor.other_call_waiting(token)
     recorder.silence_alert_s = cfg.silence_alert_minutes * 60
     recorder.silence_repeat_s = cfg.silence_alert_repeat_minutes * 60
     audio_path, speaker_events, attendee_ids = await recorder.record_call(token, name)
@@ -940,7 +944,7 @@ def main() -> None:
                         room["token"],
                     )
                     try:
-                        meta, audio_path = asyncio.run(record_call(cfg, room))
+                        meta, audio_path = asyncio.run(record_call(cfg, room, monitor))
                         processor.submit(meta, audio_path)
                     except Exception:
                         log.exception(

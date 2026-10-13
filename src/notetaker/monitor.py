@@ -87,6 +87,15 @@ class CallMonitor:
                 log.debug("Could not dismiss notification %s: %s", nid, exc)
         return tokens
 
+    def other_call_waiting(self, current_token: str) -> bool:
+        """True if a call is active in any room other than the one being
+        recorded. Read-only: it does not touch the detection bookkeeping."""
+        return any(
+            r["token"] != current_token
+            and (r.get("hasCall") or r.get("callFlag", 0) > 0)
+            for r in self._get_rooms()
+        )
+
     def check_for_new_calls(self) -> list[dict[str, Any]]:
         rooms = self._get_rooms()
 
@@ -97,8 +106,7 @@ class CallMonitor:
         rung = self._poll_call_notifications()
         for token in rung:
             if token in currently_active:
-                if token not in new_calls:
-                    log.info("Call notification for room %s: joining", token)
+                log.info("Call notification for room %s: joining", token)
                 new_calls.add(token)
             else:
                 log.info("Call notification for room %s, but no call is active", token)

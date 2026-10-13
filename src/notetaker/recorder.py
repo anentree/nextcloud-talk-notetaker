@@ -958,6 +958,10 @@ class AudioRecorder:
 
     # Set by the caller so the recorder can prove liveness during a long call.
     heartbeat_fn = None
+    # Returns True when another call is waiting for the bot. While the room is
+    # empty and in its grace period, that ends the wait early instead of
+    # making the next call sit through the rest of the 60s.
+    other_call_waiting_fn = None
     # Set by the caller: after silence_alert_s with nobody heard while others
     # are in the call, the bot says so in the call's chat, every
     # silence_repeat_s, until someone replies there. 0 disables it.
@@ -1495,7 +1499,22 @@ class AudioRecorder:
                             room_token,
                             grace_checks * 10,
                         )
-                    if empty_streak >= grace_checks:
+                    waiting = False
+                    if empty_streak < grace_checks and self.other_call_waiting_fn:
+                        try:
+                            waiting = bool(
+                                await asyncio.to_thread(self.other_call_waiting_fn)
+                            )
+                        except Exception:
+                            log.debug("Waiting-call check failed", exc_info=True)
+                    if empty_streak >= grace_checks or waiting:
+                        if waiting:
+                            log.info(
+                                "Another call is waiting; leaving room %s early "
+                                "(empty for %ds)",
+                                room_token,
+                                empty_streak * 10,
+                            )
                         log.info(
                             "Call ended in room %s (no participants for %ds)",
                             room_token,
