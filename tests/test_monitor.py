@@ -157,3 +157,113 @@ def test_all_retries_exhausted_returns_empty():
     active = monitor.check_for_new_calls()
 
     assert len(active) == 0
+
+
+NOTIFICATIONS_ENDPOINT = (
+    f"{NEXTCLOUD_URL}/ocs/v2.php/apps/notifications/api/v2/notifications"
+)
+
+
+def make_ring(nid, token, object_type="call"):
+    return {
+        "notification_id": nid,
+        "app": "spreed",
+        "object_type": object_type,
+        "object_id": token,
+    }
+
+
+@responses.activate
+def test_call_notification_rejoins_a_call_already_seen():
+    room_data = {"ocs": {"data": [make_room("abc123", "Standup", has_call=True)]}}
+    responses.get(ROOMS_ENDPOINT, json=room_data, status=200)
+    responses.get(NOTIFICATIONS_ENDPOINT, json={"ocs": {"data": []}}, status=200)
+    responses.get(ROOMS_ENDPOINT, json=room_data, status=200)
+    responses.get(
+        NOTIFICATIONS_ENDPOINT,
+        json={"ocs": {"data": [make_ring(7, "abc123")]}},
+        status=200,
+    )
+    responses.delete(f"{NOTIFICATIONS_ENDPOINT}/7", status=200)
+
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    assert len(monitor.check_for_new_calls()) == 1
+    # Same call, still active: only the ring makes it a new call again.
+    again = monitor.check_for_new_calls()
+
+    assert [r["token"] for r in again] == ["abc123"]
+
+
+@responses.activate
+def test_call_notification_is_acted_on_once():
+    room_data = {"ocs": {"data": [make_room("abc123", "Standup", has_call=True)]}}
+    ring = {"ocs": {"data": [make_ring(7, "abc123")]}}
+    for _ in range(2):
+        responses.get(ROOMS_ENDPOINT, json=room_data, status=200)
+        responses.get(NOTIFICATIONS_ENDPOINT, json=ring, status=200)
+    responses.delete(f"{NOTIFICATIONS_ENDPOINT}/7", status=500)
+
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    assert len(monitor.check_for_new_calls()) == 1
+    assert len(monitor.check_for_new_calls()) == 0
+
+
+@responses.activate
+def test_call_notification_ignored_when_no_call_is_active():
+    responses.get(
+        ROOMS_ENDPOINT,
+        json={"ocs": {"data": [make_room("abc123", "Standup", has_call=False)]}},
+        status=200,
+    )
+    responses.get(
+        NOTIFICATIONS_ENDPOINT,
+        json={"ocs": {"data": [make_ring(7, "abc123")]}},
+        status=200,
+    )
+    responses.delete(f"{NOTIFICATIONS_ENDPOINT}/7", status=200)
+
+    assert CallMonitor(NEXTCLOUD_URL, "bot", "secret").check_for_new_calls() == []
+
+
+@responses.activate
+def test_chat_notifications_do_not_trigger_a_join():
+    responses.get(
+        ROOMS_ENDPOINT,
+        json={"ocs": {"data": [make_room("abc123", "Standup", has_call=False)]}},
+        status=200,
+    )
+    responses.get(
+        NOTIFICATIONS_ENDPOINT,
+        json={"ocs": {"data": [make_ring(7, "abc123", object_type="chat")]}},
+        status=200,
+    )
+
+    assert CallMonitor(NEXTCLOUD_URL, "bot", "secret").check_for_new_calls() == []
+
+
+@responses.activate
+def test_notification_outage_does_not_break_detection():
+    responses.get(
+        ROOMS_ENDPOINT,
+        json={"ocs": {"data": [make_room("abc123", "Standup", has_call=True)]}},
+        status=200,
+    )
+    responses.get(NOTIFICATIONS_ENDPOINT, status=503)
+
+    active = CallMonitor(NEXTCLOUD_URL, "bot", "secret").check_for_new_calls()
+
+    assert [r["token"] for r in active] == ["abc123"]
+
+
+@responses.activate
+def test_no_notifications_204_is_not_an_error(caplog):
+    responses.get(
+        ROOMS_ENDPOINT,
+        json={"ocs": {"data": [make_room("abc123", "Standup", has_call=False)]}},
+        status=200,
+    )
+    responses.get(NOTIFICATIONS_ENDPOINT, status=204)
+
+    with caplog.at_level("WARNING"):
+        assert CallMonitor(NEXTCLOUD_URL, "bot", "secret").check_for_new_calls() == []
+    assert "Could not fetch call notifications" not in caplog.text

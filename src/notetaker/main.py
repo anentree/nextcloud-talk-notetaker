@@ -4,9 +4,11 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import re
 import signal
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -154,6 +156,15 @@ def _build_notes_filename(
 
 
 async def handle_call(cfg: Config, room: dict) -> None:
+    """Record one call and process it, start to finish."""
+    meta, audio_path = await record_call(cfg, room)
+    await finish_call(cfg, meta, audio_path)
+
+
+async def record_call(cfg: Config, room: dict) -> tuple[dict, str]:
+    """Join and record a call. Returns the context the rest of the pipeline
+    needs and the audio path. Only this part has to hold the poll loop: the
+    transcription that follows can run while the next call is being joined."""
     token = room["token"]
     name = room.get("displayName", token)
     call_start = datetime.now()
@@ -191,6 +202,10 @@ async def handle_call(cfg: Config, room: dict) -> None:
         "recorded_s": _in_call_seconds(recorder, call_start),
     }
 
+    return meta, audio_path
+
+
+async def finish_call(cfg: Config, meta: dict, audio_path: str) -> None:
     # Everything from here on must leave the recording in a defined state:
     # deleted if the notes are safe, moved somewhere persistent if not. An
     # exception escaping in between (a Gemini outage, a bad display name)
@@ -203,6 +218,25 @@ async def handle_call(cfg: Config, room: dict) -> None:
             _discard_audio(audio_path)
         elif os.path.exists(audio_path):
             _retain_audio(cfg, audio_path, meta)
+
+
+def _claim_audio(audio_path: str, call_start: datetime) -> str:
+    """Give a finished recording a name of its own.
+
+    The recorder names its file from the date and room and deletes any file
+    already there. Now that a recording can wait in the queue while the next
+    call is joined, a second call in the same room on the same day would
+    delete the first one's audio before it was transcribed."""
+    if not os.path.exists(audio_path):
+        return audio_path
+    base, ext = os.path.splitext(audio_path)
+    claimed = f"{base}.{call_start.strftime('%H%M%S')}{ext}"
+    try:
+        os.replace(audio_path, claimed)
+    except OSError:
+        log.exception("Could not rename %s; keeping its name", audio_path)
+        return audio_path
+    return claimed
 
 
 def _in_call_seconds(recorder, call_start: datetime) -> float:
@@ -758,6 +792,71 @@ def _touch_heartbeat(cfg: Config) -> None:
         log.debug("Could not write heartbeat file %s", cfg.heartbeat_file)
 
 
+class PostProcessor:
+    """Transcribes, saves and emails finished recordings on a thread of its
+    own, one at a time, so the poll loop is free to join the next call.
+
+    Before this, a 25-minute call took ~13 minutes to transcribe on the poll
+    thread, and a call that started meanwhile was not joined until it was done
+    (2026-10-13: Jo's call, then the accounting call)."""
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self._queue: queue.Queue = queue.Queue()
+        self._pending = 0
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run, name="post-process", daemon=False
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(self, meta: dict, audio_path: str) -> None:
+        # Counted from the moment it is queued, so the idle check cannot slip
+        # between submit() and the worker picking it up.
+        with self._lock:
+            self._pending += 1
+        self._queue.put((meta, audio_path))
+
+    @property
+    def idle(self) -> bool:
+        with self._lock:
+            return self._pending == 0
+
+    def stop(self) -> None:
+        """Finish what is queued, then end the thread. Keeps the heartbeat
+        fresh while it waits: a long transcription is work, not a hang."""
+        self._queue.put(None)
+        while self._thread.is_alive():
+            self._thread.join(timeout=30)
+            _touch_heartbeat(self.cfg)
+
+    def _run(self) -> None:
+        # Whisper uses every core and a live recording must not starve; the
+        # threads it spawns inherit this thread's priority.
+        try:
+            os.nice(10)
+        except (OSError, AttributeError):
+            pass
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            meta, audio_path = item
+            try:
+                asyncio.run(finish_call(self.cfg, meta, audio_path))
+            except Exception:
+                log.exception(
+                    "Failed to process call in room '%s' (%s)",
+                    meta.get("name"),
+                    meta.get("token"),
+                )
+            finally:
+                with self._lock:
+                    self._pending -= 1
+
+
 def main() -> None:
     # `notetaker download-model` runs before any other setting is read: the
     # wizard calls it after writing .env and before the container starts.
@@ -810,55 +909,64 @@ def main() -> None:
     else:
         log.info("Email disabled: SMTP_HOST is unset, notes will only be stored")
 
-    poll_tick = 0
-    while not shutdown:
-        _touch_heartbeat(cfg)
-        try:
-            # Retry anything that failed to send earlier. A transient mail
-            # outage now self-heals without any human action.
-            drain_spool(cfg)
+    processor = PostProcessor(cfg)
+    processor.start()
 
-            # Cheap and idempotent; keeps retained audio bounded.
-            if poll_tick % 360 == 0:
-                prune_retained_audio(cfg)
-            poll_tick += 1
+    try:
+        poll_tick = 0
+        while not shutdown:
+            _touch_heartbeat(cfg)
+            try:
+                # Retry anything that failed to send earlier. A transient mail
+                # outage now self-heals without any human action.
+                drain_spool(cfg)
 
-            new_calls = monitor.check_for_new_calls()
-            if len(new_calls) > 1:
-                log.warning(
-                    "Multiple concurrent calls detected (%d). Processing sequentially; "
-                    "later calls may be partially missed.",
-                    len(new_calls),
-                )
-            for room in new_calls:
-                log.info(
-                    "New call detected: %s (%s)",
-                    room.get("displayName"),
-                    room["token"],
-                )
-                try:
-                    asyncio.run(handle_call(cfg, room))
-                except Exception:
-                    log.exception(
-                        "Failed to process call in room '%s' (%s)",
+                # Cheap and idempotent; keeps retained audio bounded.
+                if poll_tick % 360 == 0:
+                    prune_retained_audio(cfg)
+                poll_tick += 1
+
+                new_calls = monitor.check_for_new_calls()
+                if len(new_calls) > 1:
+                    log.warning(
+                        "Multiple concurrent calls detected (%d). Processing sequentially; "
+                        "later calls may be partially missed.",
+                        len(new_calls),
+                    )
+                for room in new_calls:
+                    log.info(
+                        "New call detected: %s (%s)",
                         room.get("displayName"),
                         room["token"],
                     )
-                finally:
-                    # Clear from active set so if the call is still ongoing
-                    # (e.g. we left early), it gets re-detected next poll
-                    monitor.clear_token(room["token"])
+                    try:
+                        meta, audio_path = asyncio.run(record_call(cfg, room))
+                        processor.submit(meta, audio_path)
+                    except Exception:
+                        log.exception(
+                            "Failed to process call in room '%s' (%s)",
+                            room.get("displayName"),
+                            room["token"],
+                        )
+                    finally:
+                        # Clear from active set so if the call is still ongoing
+                        # (e.g. we left early), it gets re-detected next poll
+                        monitor.clear_token(room["token"])
 
-            # Only when nothing live is waiting: a retry transcribes a whole
-            # meeting on this thread, and a call that starts meanwhile would
-            # be joined late. New calls always come first.
-            if not new_calls:
-                drain_retained(cfg)
-        except Exception:
-            log.exception("Error in poll cycle")
+                # Only when nothing live is waiting and the worker is free: a retry
+                # transcribes a whole meeting on this thread, and a call that
+                # starts meanwhile would be joined late. New calls always come
+                # first.
+                if not new_calls and processor.idle:
+                    drain_retained(cfg)
+            except Exception:
+                log.exception("Error in poll cycle")
 
-        time.sleep(cfg.poll_interval)
-
+            time.sleep(cfg.poll_interval)
+    finally:
+        if not processor.idle:
+            log.info("Finishing queued recordings before stopping...")
+        processor.stop()
     log.info("Notetaker stopped.")
 
 

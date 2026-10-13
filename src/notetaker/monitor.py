@@ -17,6 +17,9 @@ class CallMonitor:
         self.base_url = nextcloud_url.rstrip("/")
         self.auth = (user, password)
         self._active_tokens: set[str] = set()
+        # Notification ids already acted on, so a failed dismissal cannot
+        # make the same ring join the same call twice.
+        self._seen_rings: set[int] = set()
 
     def _get_rooms(self) -> list[dict[str, Any]]:
         url = f"{self.base_url}/ocs/v2.php/apps/spreed/api/v4/room"
@@ -45,6 +48,45 @@ class CallMonitor:
         log.error("Failed to fetch rooms after %d attempts: %s", MAX_RETRIES, last_exc)
         return []
 
+    def _poll_call_notifications(self) -> set[str]:
+        """Room tokens of "call notification" rings sent to the bot.
+
+        Pressing "Send call notification" in Talk raises a spreed notification
+        of object_type "call" whose object_id is the room token. It is the
+        user's explicit "join this call now", so it overrides the usual
+        already-seen bookkeeping. Best effort: a notifications outage must
+        never stop ordinary call detection.
+        """
+        url = f"{self.base_url}/ocs/v2.php/apps/notifications/api/v2/notifications"
+        headers = {"OCS-APIRequest": "true", "Accept": "application/json"}
+        try:
+            resp = requests.get(url, auth=self.auth, headers=headers, timeout=15)
+            resp.raise_for_status()
+            # 204 with no body is how Nextcloud says "no notifications".
+            if resp.status_code == 204 or not resp.content:
+                return set()
+            notifications = resp.json()["ocs"]["data"]
+        except Exception as exc:
+            log.warning("Could not fetch call notifications: %s", exc)
+            return set()
+
+        tokens: set[str] = set()
+        for n in notifications:
+            if n.get("app") != "spreed" or n.get("object_type") != "call":
+                continue
+            nid = n.get("notification_id")
+            if nid in self._seen_rings:
+                continue
+            self._seen_rings.add(nid)
+            tokens.add(str(n.get("object_id")))
+            try:
+                requests.delete(
+                    f"{url}/{nid}", auth=self.auth, headers=headers, timeout=15
+                )
+            except Exception as exc:
+                log.debug("Could not dismiss notification %s: %s", nid, exc)
+        return tokens
+
     def check_for_new_calls(self) -> list[dict[str, Any]]:
         rooms = self._get_rooms()
 
@@ -52,6 +94,14 @@ class CallMonitor:
             r["token"] for r in rooms if r.get("hasCall") or r.get("callFlag", 0) > 0
         }
         new_calls = currently_active - self._active_tokens
+        rung = self._poll_call_notifications()
+        for token in rung:
+            if token in currently_active:
+                if token not in new_calls:
+                    log.info("Call notification for room %s: joining", token)
+                new_calls.add(token)
+            else:
+                log.info("Call notification for room %s, but no call is active", token)
         ended_calls = self._active_tokens - currently_active
 
         for token in ended_calls:

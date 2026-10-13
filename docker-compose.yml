@@ -3,6 +3,9 @@ services:
     build: .
     env_file: .env
     restart: unless-stopped
+    # A queued recording is transcribed before the process exits (about 45
+    # minutes per hour of call); the 10s default would SIGKILL it and lose it.
+    stop_grace_period: 60m
     shm_size: "1g"
     extra_hosts:
       - "host.docker.internal:host-gateway"
