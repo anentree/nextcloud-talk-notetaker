@@ -185,6 +185,7 @@ async def record_call(
     recorder.heartbeat_fn = lambda: _touch_heartbeat(cfg)
     if monitor is not None:
         recorder.other_call_waiting_fn = lambda: monitor.other_call_waiting(token)
+        recorder.interrupt_fn = lambda: monitor.ring_for_other_room(token)
     recorder.silence_alert_s = cfg.silence_alert_minutes * 60
     recorder.silence_repeat_s = cfg.silence_alert_repeat_minutes * 60
     audio_path, speaker_events, attendee_ids = await recorder.record_call(token, name)

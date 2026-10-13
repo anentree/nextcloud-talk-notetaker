@@ -962,6 +962,9 @@ class AudioRecorder:
     # empty and in its grace period, that ends the wait early instead of
     # making the next call sit through the rest of the 60s.
     other_call_waiting_fn = None
+    # Returns True when the bot has been rung into a different call: leave this
+    # one at once, whoever is still in it.
+    interrupt_fn = None
     # Set by the caller: after silence_alert_s with nobody heard while others
     # are in the call, the bot says so in the call's chat, every
     # silence_repeat_s, until someone replies there. 0 disables it.
@@ -1490,6 +1493,22 @@ class AudioRecorder:
                         )
                 else:
                     silent_streak = 0
+
+                if self.interrupt_fn:
+                    try:
+                        interrupted = bool(await asyncio.to_thread(self.interrupt_fn))
+                    except Exception:
+                        interrupted = False
+                        log.debug("Interrupt check failed", exc_info=True)
+                    if interrupted:
+                        log.info(
+                            "Rung into another call; leaving room %s now",
+                            room_token,
+                        )
+                        self.in_call_s = max(
+                            0.0, time.monotonic() - joined_at - empty_streak * 10
+                        )
+                        break
 
                 if not others_present:
                     empty_streak += 1

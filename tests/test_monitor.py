@@ -1,3 +1,4 @@
+from unittest.mock import patch
 import responses
 from notetaker.monitor import CallMonitor
 
@@ -298,3 +299,79 @@ def test_other_call_waiting_ignores_the_current_room():
     monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
     assert monitor.other_call_waiting("mine") is False
     assert monitor.other_call_waiting("mine") is True
+
+
+def _rooms(*calls):
+    return {
+        "ocs": {"data": [make_room(t, t, has_call=a) for t, a in calls]}
+    }
+
+
+@responses.activate
+def test_ring_for_another_room_interrupts_and_is_joined_afterwards():
+    responses.get(ROOMS_ENDPOINT, json=_rooms(("mine", True), ("next", True)))
+    responses.get(
+        NOTIFICATIONS_ENDPOINT, json={"ocs": {"data": [make_ring(9, "next")]}}
+    )
+    responses.delete(f"{NOTIFICATIONS_ENDPOINT}/9", status=200)
+    # After the recording ends the main loop polls again.
+    responses.get(ROOMS_ENDPOINT, json=_rooms(("next", True)))
+    responses.get(NOTIFICATIONS_ENDPOINT, status=204)
+
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    assert monitor.ring_for_other_room("mine") is True
+    assert [r["token"] for r in monitor.check_for_new_calls()] == ["next"]
+
+
+@responses.activate
+def test_ring_for_the_current_room_does_not_interrupt():
+    responses.get(
+        NOTIFICATIONS_ENDPOINT, json={"ocs": {"data": [make_ring(9, "mine")]}}
+    )
+    responses.delete(f"{NOTIFICATIONS_ENDPOINT}/9", status=200)
+
+    assert CallMonitor(NEXTCLOUD_URL, "bot", "secret").ring_for_other_room("mine") is False
+
+
+@responses.activate
+def test_ring_for_an_ended_call_does_not_interrupt():
+    responses.get(
+        NOTIFICATIONS_ENDPOINT, json={"ocs": {"data": [make_ring(9, "gone")]}}
+    )
+    responses.delete(f"{NOTIFICATIONS_ENDPOINT}/9", status=200)
+    responses.get(ROOMS_ENDPOINT, json=_rooms(("mine", True), ("gone", False)))
+
+    assert CallMonitor(NEXTCLOUD_URL, "bot", "secret").ring_for_other_room("mine") is False
+
+
+@responses.activate
+def test_rung_room_is_joined_before_the_room_that_was_left():
+    responses.get(ROOMS_ENDPOINT, json=_rooms(("old", True), ("next", True)))
+    responses.get(
+        NOTIFICATIONS_ENDPOINT, json={"ocs": {"data": [make_ring(9, "next")]}}
+    )
+    responses.delete(f"{NOTIFICATIONS_ENDPOINT}/9", status=200)
+
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    # "old" was just abandoned (cleared) and is listed first by Talk.
+    order = [r["token"] for r in monitor.check_for_new_calls()]
+
+    assert order == ["next", "old"]
+
+
+@responses.activate
+def test_ring_survives_a_failed_room_lookup():
+    responses.get(
+        NOTIFICATIONS_ENDPOINT, json={"ocs": {"data": [make_ring(9, "next")]}}
+    )
+    responses.delete(f"{NOTIFICATIONS_ENDPOINT}/9", status=200)
+    responses.get(ROOMS_ENDPOINT, status=500)
+    responses.get(ROOMS_ENDPOINT, status=500)
+    responses.get(ROOMS_ENDPOINT, status=500)
+    responses.get(ROOMS_ENDPOINT, json=_rooms(("mine", True), ("next", True)))
+
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    with patch("notetaker.monitor.time.sleep"):
+        assert monitor.ring_for_other_room("mine") is False
+    responses.get(NOTIFICATIONS_ENDPOINT, status=204)
+    assert monitor.ring_for_other_room("mine") is True

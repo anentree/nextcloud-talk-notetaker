@@ -20,6 +20,8 @@ class CallMonitor:
         # Notification ids already acted on, so a failed dismissal cannot
         # make the same ring join the same call twice.
         self._seen_rings: set[int] = set()
+        # Rings read while a call was being recorded, not yet acted on.
+        self._pending_rings: set[str] = set()
 
     def _get_rooms(self) -> list[dict[str, Any]]:
         url = f"{self.base_url}/ocs/v2.php/apps/spreed/api/v4/room"
@@ -87,6 +89,27 @@ class CallMonitor:
                 log.debug("Could not dismiss notification %s: %s", nid, exc)
         return tokens
 
+    def ring_for_other_room(self, current_token: str) -> bool:
+        """True if someone rang the bot into a call in a room other than the
+        one being recorded. The ring is kept for check_for_new_calls, which
+        joins it as soon as the recording is finished."""
+        self._pending_rings |= self._poll_call_notifications()
+        self._pending_rings.discard(current_token)
+        if not self._pending_rings:
+            return False
+        rooms = self._get_rooms()
+        if not rooms:
+            # The room list failed (it returns [] after its retries). The ring
+            # is already dismissed, so keep it for the next try.
+            return False
+        active = {
+            r["token"] for r in rooms if r.get("hasCall") or r.get("callFlag", 0) > 0
+        }
+        # A ring for a call that has ended must not pull the bot out of one
+        # that is still going.
+        self._pending_rings &= active
+        return bool(self._pending_rings)
+
     def other_call_waiting(self, current_token: str) -> bool:
         """True if a call is active in any room other than the one being
         recorded. Read-only: it does not touch the detection bookkeeping."""
@@ -103,7 +126,8 @@ class CallMonitor:
             r["token"] for r in rooms if r.get("hasCall") or r.get("callFlag", 0) > 0
         }
         new_calls = currently_active - self._active_tokens
-        rung = self._poll_call_notifications()
+        rung = self._poll_call_notifications() | self._pending_rings
+        self._pending_rings = set()
         for token in rung:
             if token in currently_active:
                 log.info("Call notification for room %s: joining", token)
@@ -116,7 +140,12 @@ class CallMonitor:
             log.info("Call ended in room %s", token)
         self._active_tokens = currently_active
 
-        return [r for r in rooms if r["token"] in new_calls]
+        # Rung rooms first: the bot has just left another call for them, and
+        # must not be sent straight back to the room it left.
+        return sorted(
+            (r for r in rooms if r["token"] in new_calls),
+            key=lambda r: r["token"] not in rung,
+        )
 
     def clear_token(self, token: str) -> None:
         """Remove a token from the active set.
