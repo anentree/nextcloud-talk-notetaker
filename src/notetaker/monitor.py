@@ -22,6 +22,9 @@ class CallMonitor:
         self._seen_rings: set[int] = set()
         # Rings read while a call was being recorded, not yet acted on.
         self._pending_rings: set[str] = set()
+        # Rooms already logged as showing a call with nobody in it, so a
+        # lingering session is reported once, not every poll.
+        self._empty_logged: set[str] = set()
 
     def _get_rooms(self) -> list[dict[str, Any]]:
         url = f"{self.base_url}/ocs/v2.php/apps/spreed/api/v4/room"
@@ -116,6 +119,8 @@ class CallMonitor:
         return any(
             r["token"] != current_token
             and (r.get("hasCall") or r.get("callFlag", 0) > 0)
+            # A lingering session is not a call waiting for the bot.
+            and not self._nobody_in_call(r["token"])
             for r in self._get_rooms()
         )
 
@@ -126,7 +131,20 @@ class CallMonitor:
             r["token"] for r in rooms if r.get("hasCall") or r.get("callFlag", 0) > 0
         }
         new_calls = currently_active - self._active_tokens
+        # A room can look "in a call" with nobody in it: the bot's own session
+        # lingers ~30s after it leaves. Joining that is how the bot used to
+        # chase the call it had just left, and once the lingering session
+        # expired it would start a new call and ring everyone. A call only
+        # counts once a person is in it. Not remembered as active meanwhile,
+        # so it is looked at again on the next poll, when someone may have
+        # joined.
         rung = self._poll_call_notifications() | self._pending_rings
+        empty = {
+            token
+            for token in new_calls
+            if token not in rung and self._nobody_in_call(token)
+        }
+        new_calls -= empty
         self._pending_rings = set()
         for token in rung:
             if token in currently_active:
@@ -138,7 +156,8 @@ class CallMonitor:
 
         for token in ended_calls:
             log.info("Call ended in room %s", token)
-        self._active_tokens = currently_active
+        self._active_tokens = currently_active - empty
+        self._empty_logged &= currently_active
 
         # Rung rooms first: the bot has just left another call for them, and
         # must not be sent straight back to the room it left.
@@ -146,6 +165,24 @@ class CallMonitor:
             (r for r in rooms if r["token"] in new_calls),
             key=lambda r: r["token"] not in rung,
         )
+
+    def _nobody_in_call(self, token: str) -> bool:
+        """True when the room's call has no participant but the bot in it.
+        Unknown (the check failed) counts as somebody: a missed meeting costs
+        more than a pointless join."""
+        # Imported here: the recorder pulls in the browser stack.
+        from notetaker.recorder import _call_presence
+
+        presence = _call_presence(self.base_url, self.auth, token, self.auth[0])
+        if presence is None:
+            return False
+        if presence[1] > 0:
+            self._empty_logged.discard(token)
+            return False
+        if token not in self._empty_logged:
+            self._empty_logged.add(token)
+            log.info("Room %s shows a call but nobody is in it; not joining", token)
+        return True
 
     def clear_token(self, token: str) -> None:
         """Remove a token from the active set.

@@ -14,6 +14,35 @@ log = logging.getLogger(__name__)
 
 OCS_HEADERS = {"OCS-APIRequest": "true", "Accept": "application/json"}
 
+
+class CallNotJoinable(Exception):
+    """The call ended before the bot could join it.
+
+    Talk then offers "Start call" where it offered "Join call". The bot never
+    starts a call: that rings everyone in the room, and it is what kept
+    calling people back after they hung up (2026-10-27). The bot's own
+    session lingers ~30s after it closes the browser, the monitor sees the
+    room still "in a call", and by the time the browser has loaded the
+    lingering session has expired and the button has turned into "Start
+    call".
+    """
+
+
+# Talk's "Start call" button, top bar and media-settings dialog alike.
+START_CALL_SELECTOR = (
+    'button:has-text("Start call"), [data-tooltip="Start call"],'
+    ' [aria-label="Start call" i]'
+)
+# The hang-up button. "End call for everyone" is a different control and is
+# never clicked: it would end the call for people still in it.
+LEAVE_CALL_SELECTOR = (
+    'button:has-text("Leave call"):not(:has-text("everyone")),'
+    ' [data-tooltip="Leave call"], [aria-label="Leave call" i]'
+)
+# After hanging up, how long to wait for Talk to drop the bot from the call.
+LEAVE_CONFIRM_POLLS = 3
+LEAVE_CONFIRM_INTERVAL_S = 2
+
 # JavaScript injected into the browser BEFORE Talk loads.
 # Intercepts RTCPeerConnection to capture all remote audio streams
 # via Web Audio API + MediaRecorder.
@@ -978,13 +1007,15 @@ class AudioRecorder:
         rejoin a call the bot was dropped from; raises if no join button
         appears.
 
-        A rejoin only ever clicks "Join call": the call is known to be
-        running, so "Start call" could only appear in a race with the call
-        ending, and clicking it would start a new call that rings the room.
+        Neither a join nor a rejoin ever clicks "Start call". The bot only
+        goes to calls that are running, so "Start call" can only appear in a
+        race with the call ending (a first join loads the page for 20-30s),
+        and clicking it would start a new call that rings the room. When that
+        is what the page offers, this raises CallNotJoinable.
         """
         # Click the actual "Join call" button inside the dialog
         # (audio/video are already muted at the getUserMedia level)
-        dialog_texts = ("Join call",) if rejoin else ("Join call", "Start call")
+        dialog_texts = ("Join call",)
         dialog_selectors = [
             f'{scope} button:has-text("{text}")'
             for scope in (".media-settings", ".modal-container")
@@ -1012,16 +1043,26 @@ class AudioRecorder:
         else:
             selector = (
                 'button:has-text("Join call"),'
-                ' button:has-text("Start call"),'
                 ' [data-tooltip="Join call"],'
-                ' [data-tooltip="Start call"],'
                 # Catch-all for a relabelled button. Never on a rejoin: if
                 # the bot is in fact still in the call, this matches "Leave
-                # call".
+                # call". Never "Start call" either way.
                 ' .top-bar button[aria-label*="call" i]'
+                ':not([aria-label*="start" i]):not([aria-label*="leave" i])'
             )
+        if await self._start_call_offered(page):
+            raise CallNotJoinable("the page offers Start call, not Join call")
         join_btn = page.locator(selector)
-        await join_btn.first.click(timeout=30000)
+        try:
+            await join_btn.first.click(timeout=30000)
+        except Exception:
+            # No Join call button ever appeared. If Start call did, the call
+            # ended while the page loaded.
+            if await self._start_call_offered(page):
+                raise CallNotJoinable(
+                    "the page offers Start call, not Join call"
+                ) from None
+            raise
         log.info("Clicked initial Join call button")
 
         # Wait for media settings dialog to appear
@@ -1035,6 +1076,12 @@ class AudioRecorder:
             await dialog_join.first.click()
             log.info("Clicked dialog Join call button (media settings)")
         except Exception:
+            if await self._start_call_offered(page):
+                # The call ended between the two clicks; the dialog now
+                # offers Start call.
+                raise CallNotJoinable(
+                    "the media settings dialog offers Start call"
+                ) from None
             log.info("No media settings dialog found, may have joined directly")
             # Try clicking any remaining visible join button
             try:
@@ -1051,6 +1098,67 @@ class AudioRecorder:
                         break
             except Exception:
                 log.info("No additional join buttons found")
+
+    async def _start_call_offered(self, page) -> bool:
+        """True when a visible "Start call" button is on the page, which means
+        no call is running. Only used to stop cleanly: the join selectors
+        never match "Start call", so the bot cannot click it either way."""
+        try:
+            return bool(
+                await page.locator(
+                    START_CALL_SELECTOR + " >> visible=true"
+                ).first.is_visible()
+            )
+        except Exception:
+            return False
+
+    async def _leave_call(self, page, room_token: str, auth: tuple) -> None:
+        """Hang up, and wait until Talk agrees the bot is out of the call.
+
+        Closing the browser leaves the bot's session in the call for ~30s
+        (the signaling server only expires it after its timeout). In that
+        window the room still looks like a running call. Leaving first keeps
+        the call from outliving the last person by half a minute.
+
+        Best effort and never raises: the audio is already out of the
+        browser, and a failed hang-up only means the old behaviour (the
+        session expiring by itself), which the monitor now ignores.
+        """
+        try:
+            # One visibility filter after the whole list, as elsewhere: a hidden
+            # "Leave call" (a closed menu item) must not be .first.
+            await page.locator(
+                LEAVE_CALL_SELECTOR + " >> visible=true"
+            ).first.click(timeout=5000)
+            log.info("Clicked Leave call in room %s", room_token)
+        except Exception as exc:
+            log.warning(
+                "Could not click Leave call in room %s: %s: %s",
+                room_token,
+                type(exc).__name__,
+                exc,
+            )
+        for attempt in range(2):
+            for _ in range(LEAVE_CONFIRM_POLLS):
+                presence = await asyncio.to_thread(
+                    _call_presence, self.nextcloud_url, auth, room_token, self.user
+                )
+                if presence is not None and not presence[2]:
+                    log.info("Left the call in room %s", room_token)
+                    return
+                await asyncio.sleep(LEAVE_CONFIRM_INTERVAL_S)
+            if attempt == 0:
+                # Talk hangs up on page unload, but only when the page is
+                # closed in a way that runs the unload handlers.
+                try:
+                    await page.close(run_before_unload=True)
+                except Exception:  # noqa: BLE001
+                    log.debug("Closing the page for unload failed", exc_info=True)
+        log.warning(
+            "Still listed in the call in room %s after hanging up; its "
+            "session will expire by itself",
+            room_token,
+        )
 
     async def _call_button_labels(self, page) -> list[str]:
         """Labels of the call buttons on the page, for a failed rejoin's log."""
@@ -1743,6 +1851,7 @@ class AudioRecorder:
                     f.write(audio_data)
                 total_audio_bytes += len(audio_data)
 
+            await self._leave_call(page, room_token, auth)
             await browser.close()
 
         if total_audio_bytes > 0:

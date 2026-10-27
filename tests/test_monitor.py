@@ -375,3 +375,130 @@ def test_ring_survives_a_failed_room_lookup():
         assert monitor.ring_for_other_room("mine") is False
     responses.get(NOTIFICATIONS_ENDPOINT, status=204)
     assert monitor.ring_for_other_room("mine") is True
+
+
+# A room that shows a call with nobody but the bot in it: the bot's own session
+# lingers ~30s after it leaves. Joining it made the bot chase the call it had
+# just left and, once the session expired, start a new one that rang everyone
+# (2026-10-27).
+def participants_endpoint(token):
+    return f"{ROOMS_ENDPOINT}/{token}/participants"
+
+
+def participants(*in_call):
+    return {
+        "ocs": {
+            "data": [{"actorId": "bot", "actorType": "users", "inCall": 7}]
+            + [
+                {"actorId": name, "actorType": "users", "inCall": flag}
+                for name, flag in in_call
+            ]
+        }
+    }
+
+
+def rooms_with_call():
+    return {"ocs": {"data": [make_room("abc123", "Standup", has_call=True)]}}
+
+
+@responses.activate
+def test_a_call_with_only_the_bot_in_it_is_not_joined():
+    responses.get(ROOMS_ENDPOINT, json=rooms_with_call())
+    responses.get(participants_endpoint("abc123"), json=participants(("neo", 0)))
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    assert monitor.check_for_new_calls() == []
+
+
+@responses.activate
+def test_a_call_with_a_person_in_it_is_joined():
+    responses.get(ROOMS_ENDPOINT, json=rooms_with_call())
+    responses.get(participants_endpoint("abc123"), json=participants(("neo", 7)))
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    assert [r["token"] for r in monitor.check_for_new_calls()] == ["abc123"]
+
+
+@responses.activate
+def test_a_person_joining_the_lingering_call_is_still_picked_up():
+    """An empty call must not be remembered as seen, or a person who joins it
+    a few seconds later would never be recorded."""
+    responses.get(ROOMS_ENDPOINT, json=rooms_with_call())
+    responses.get(participants_endpoint("abc123"), json=participants(("neo", 0)))
+    responses.get(participants_endpoint("abc123"), json=participants(("neo", 7)))
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    assert monitor.check_for_new_calls() == []
+    assert [r["token"] for r in monitor.check_for_new_calls()] == ["abc123"]
+
+
+@responses.activate
+def test_a_failed_participants_check_still_joins_the_call():
+    """A missed meeting costs more than a pointless join."""
+    responses.get(ROOMS_ENDPOINT, json=rooms_with_call())
+    responses.get(participants_endpoint("abc123"), status=500)
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    assert [r["token"] for r in monitor.check_for_new_calls()] == ["abc123"]
+
+
+@responses.activate
+def test_a_person_still_in_the_call_the_bot_left_early_is_rejoined():
+    """clear_token exists for a call the bot left for another one: people are
+    still in it, so it is re-detected."""
+    responses.get(ROOMS_ENDPOINT, json=rooms_with_call())
+    responses.get(participants_endpoint("abc123"), json=participants(("neo", 7)))
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    assert len(monitor.check_for_new_calls()) == 1
+    monitor.clear_token("abc123")
+    assert len(monitor.check_for_new_calls()) == 1
+
+
+@responses.activate
+def test_a_rung_call_is_joined_even_if_it_looks_empty():
+    """"Send call notification" is a person asking the bot to come."""
+    responses.get(ROOMS_ENDPOINT, json=rooms_with_call())
+    responses.get(participants_endpoint("abc123"), json=participants(("neo", 0)))
+    responses.get(
+        f"{NEXTCLOUD_URL}/ocs/v2.php/apps/notifications/api/v2/notifications",
+        json={
+            "ocs": {
+                "data": [
+                    {
+                        "notification_id": 5,
+                        "app": "spreed",
+                        "object_type": "call",
+                        "object_id": "abc123",
+                    }
+                ]
+            }
+        },
+    )
+    responses.delete(
+        f"{NEXTCLOUD_URL}/ocs/v2.php/apps/notifications/api/v2/notifications/5"
+    )
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    assert [r["token"] for r in monitor.check_for_new_calls()] == ["abc123"]
+
+
+@responses.activate
+def test_an_empty_lingering_call_is_logged_once(caplog):
+    responses.get(ROOMS_ENDPOINT, json=rooms_with_call())
+    responses.get(participants_endpoint("abc123"), json=participants(("neo", 0)))
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    with caplog.at_level("INFO", logger="notetaker.monitor"):
+        for _ in range(3):
+            monitor.check_for_new_calls()
+    assert sum("nobody is in it" in r.message for r in caplog.records) == 1
+
+
+@responses.activate
+def test_a_lingering_call_is_not_a_call_waiting_for_the_bot():
+    responses.get(ROOMS_ENDPOINT, json=rooms_with_call())
+    responses.get(participants_endpoint("abc123"), json=participants(("neo", 0)))
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    assert monitor.other_call_waiting("elsewhere") is False
+
+
+@responses.activate
+def test_a_call_with_a_person_in_it_is_a_call_waiting_for_the_bot():
+    responses.get(ROOMS_ENDPOINT, json=rooms_with_call())
+    responses.get(participants_endpoint("abc123"), json=participants(("neo", 7)))
+    monitor = CallMonitor(NEXTCLOUD_URL, "bot", "secret")
+    assert monitor.other_call_waiting("elsewhere") is True

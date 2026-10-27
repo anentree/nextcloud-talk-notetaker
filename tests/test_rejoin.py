@@ -195,19 +195,22 @@ async def test_a_bot_alone_after_the_call_ends_never_rejoins():
 
 
 @pytest.mark.asyncio
-async def test_a_rejoin_never_clicks_start_call():
+async def test_no_join_ever_clicks_start_call():
+    """Start call rings the whole room. Only the visibility check may name it;
+    nothing the bot clicks may match it, on a first join or a rejoin."""
+    from notetaker.recorder import START_CALL_SELECTOR
+
     here = ({"neo"}, 1, True)
     dropped = ({"neo"}, 1, False)
     join = await _record([here, dropped, dropped, here])
-    # Each join builds a top-bar locator and a fallback locator.
-    first, rejoin = join.selectors[:2], join.selectors[2:]
-    assert all("Start call" in sel for sel in first)  # the check can see it
-    assert len(rejoin) == 2
-    assert all("Start call" not in sel for sel in rejoin)
-    # Each join builds an open-dialog locator and a dialog locator.
-    assert all("Start call" in sel for sel in join.dialog.selectors[:2])
+    check = START_CALL_SELECTOR + " >> visible=true"
+    clickable = [sel for sel in join.selectors if sel != check]
+    # The relabelled-button catch-all must exclude Start call and Leave call.
+    assert any('not([aria-label*="start" i])' in sel for sel in clickable[:2])
+    assert len(clickable) == 4  # two joins, a top-bar and a fallback locator each
+    assert all("Start call" not in sel for sel in clickable)
     assert len(join.dialog.selectors) == 4
-    assert all("Start call" not in sel for sel in join.dialog.selectors[2:])
+    assert all("Start call" not in sel for sel in join.dialog.selectors)
 
 
 @pytest.mark.asyncio
@@ -274,7 +277,7 @@ async def test_the_open_dialog_check_uses_the_visible_only_locator():
     route = join.page.locator
 
     def locator(selector):
-        if "visible=true" in selector:
+        if "visible=true" in selector and ".media-settings" in selector:
             return visible_only
         return route(selector)
 
@@ -556,3 +559,182 @@ def test_someone_replied_is_false_when_nothing_is_new():
     url = f"{NEXTCLOUD_URL}/ocs/v2.php/apps/spreed/api/v1/chat/abc123"
     responses.get(url, status=304)
     assert _someone_replied(NEXTCLOUD_URL, ("bot", "s"), "abc123", "bot", 500) is False
+
+
+def _scripted_page(start_visible, join_click_fails=False, dialog_appears=True):
+    """A page whose "Start call" visibility is answered from a list, one
+    answer per check, and whose clicks are recorded."""
+    answers = list(start_visible)
+    clicks = []
+    page = MagicMock()
+
+    def locator(selector):
+        loc = MagicMock()
+        loc.first = AsyncMock()
+        if "Start call" in selector and selector.endswith(">> visible=true"):
+            loc.first.is_visible = AsyncMock(
+                side_effect=lambda: answers.pop(0) if answers else False
+            )
+        else:
+            loc.first.is_visible = AsyncMock(return_value=False)
+            loc.first.click = AsyncMock(
+                side_effect=lambda **kw: clicks.append(selector)
+                if not join_click_fails
+                else (_ for _ in ()).throw(TimeoutError("no join button"))
+            )
+            if dialog_appears:
+                loc.first.wait_for = AsyncMock()
+            else:
+                loc.first.wait_for = AsyncMock(side_effect=TimeoutError("no dialog"))
+            loc.count = AsyncMock(return_value=0)
+        return loc
+
+    page.locator = locator
+    page.clicks = clicks
+    return page
+
+
+@pytest.mark.asyncio
+async def test_a_first_join_refuses_when_the_page_offers_start_call():
+    from notetaker.recorder import CallNotJoinable
+
+    page = _scripted_page([True])
+    with (
+        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
+        pytest.raises(CallNotJoinable),
+    ):
+        await _make_recorder()._join_call(page)
+    assert page.clicks == []
+
+
+@pytest.mark.asyncio
+async def test_a_join_that_finds_no_button_reports_the_call_ended():
+    """The page loaded after the call ended: no Join call, and Start call
+    appears only after the first look (the pre-click check saw neither)."""
+    from notetaker.recorder import CallNotJoinable
+
+    page = _scripted_page([False, True], join_click_fails=True)
+    with (
+        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
+        pytest.raises(CallNotJoinable),
+    ):
+        await _make_recorder()._join_call(page)
+
+
+@pytest.mark.asyncio
+async def test_a_join_without_any_button_is_still_an_ordinary_error():
+    page = _scripted_page([False, False], join_click_fails=True)
+    with (
+        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
+        pytest.raises(TimeoutError),
+    ):
+        await _make_recorder()._join_call(page)
+
+
+@pytest.mark.asyncio
+async def test_a_dialog_that_turned_into_start_call_aborts_the_join():
+    """The call ended between the top-bar click and the dialog click."""
+    from notetaker.recorder import CallNotJoinable
+
+    page = _scripted_page([False, True], dialog_appears=False)
+    with (
+        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
+        pytest.raises(CallNotJoinable),
+    ):
+        await _make_recorder()._join_call(page)
+    assert len(page.clicks) == 1  # the top-bar Join call only
+
+
+@pytest.mark.asyncio
+async def test_a_normal_join_is_unchanged():
+    page = _scripted_page([False, False])
+    with patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()):
+        await _make_recorder()._join_call(page)
+    assert len(page.clicks) == 2  # top bar, then the dialog
+
+
+def _leaving_page(click_fails=False):
+    page = MagicMock()
+    leave = MagicMock()
+    leave.first = AsyncMock()
+    if click_fails:
+        leave.first.click = AsyncMock(side_effect=TimeoutError("no leave button"))
+    else:
+        leave.first.click = AsyncMock()
+    page.locator = MagicMock(return_value=leave)
+    page.close = AsyncMock()
+    page.leave = leave
+    return page
+
+
+@pytest.mark.asyncio
+async def test_the_bot_hangs_up_before_closing_the_browser():
+    from notetaker.recorder import LEAVE_CALL_SELECTOR
+
+    page = _leaving_page()
+    out = (set(), 0, False)
+    with (
+        patch("notetaker.recorder._call_presence", return_value=out) as presence,
+        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
+    ):
+        await _make_recorder()._leave_call(page, "abc123", ("bot", "s"))
+    page.locator.assert_called_once_with(LEAVE_CALL_SELECTOR + " >> visible=true")
+    page.leave.first.click.assert_awaited_once()
+    presence.assert_called_once()
+    page.close.assert_not_awaited()  # Talk agreed at once; nothing more to do
+
+
+def test_the_leave_selector_cannot_match_end_call_for_everyone():
+    from notetaker.recorder import LEAVE_CALL_SELECTOR
+
+    assert "End call" not in LEAVE_CALL_SELECTOR
+    assert ':not(:has-text("everyone"))' in LEAVE_CALL_SELECTOR
+
+
+@pytest.mark.asyncio
+async def test_a_bot_that_stays_listed_closes_the_page_to_run_unload_hangup():
+    page = _leaving_page()
+    still_in = (set(), 0, True)
+    with (
+        patch("notetaker.recorder._call_presence", return_value=still_in),
+        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
+    ):
+        await _make_recorder()._leave_call(page, "abc123", ("bot", "s"))
+    page.close.assert_awaited_once_with(run_before_unload=True)
+
+
+@pytest.mark.asyncio
+async def test_a_missing_leave_button_never_stops_the_recording_finishing():
+    page = _leaving_page(click_fails=True)
+    out = (set(), 0, False)
+    with (
+        patch("notetaker.recorder._call_presence", return_value=out),
+        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
+    ):
+        await _make_recorder()._leave_call(page, "abc123", ("bot", "s"))  # no raise
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_api_never_stops_the_recording_finishing():
+    page = _leaving_page()
+    with (
+        patch("notetaker.recorder._call_presence", return_value=None),
+        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
+    ):
+        await _make_recorder()._leave_call(page, "abc123", ("bot", "s"))  # no raise
+
+
+@pytest.mark.asyncio
+async def test_record_call_hangs_up_once_after_the_recording():
+    recorder, pw_ctx, join = _join_tracking_page()
+    leave = AsyncMock()
+    with (
+        patch("playwright.async_api.async_playwright", return_value=pw_ctx),
+        patch(
+            "notetaker.recorder._call_presence", return_value=(set(), 0, True)
+        ),
+        patch("notetaker.recorder.asyncio.sleep", new=AsyncMock()),
+        patch.object(type(recorder), "_leave_call", leave),
+    ):
+        await recorder.record_call("abc123", "Accounting Talk")
+    leave.assert_awaited_once()

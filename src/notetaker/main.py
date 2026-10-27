@@ -18,7 +18,7 @@ from notetaker.mailer import extract_follow_up_email, send_notes_email
 from notetaker.monitor import CallMonitor
 from notetaker.participants import get_participant_emails
 from notetaker.preflight import run_preflight
-from notetaker.recorder import AudioRecorder
+from notetaker.recorder import AudioRecorder, CallNotJoinable
 from notetaker.storage import upload_notes
 from notetaker.transcriber import NO_SPEECH_SENTINEL, make_notes
 
@@ -947,6 +947,12 @@ def main() -> None:
                     try:
                         meta, audio_path = asyncio.run(record_call(cfg, room, monitor))
                         processor.submit(meta, audio_path)
+                    except CallNotJoinable as exc:
+                        # The call ended while the browser loaded. Nothing was
+                        # recorded and nothing was started.
+                        log.info(
+                            "Not joining room %s: %s", room["token"], exc
+                        )
                     except Exception:
                         log.exception(
                             "Failed to process call in room '%s' (%s)",
